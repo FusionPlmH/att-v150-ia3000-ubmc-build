@@ -1,0 +1,24 @@
+# 构建过程产生的临时文件
+*.log
+build.log
+serial-*.log
+setupkeys-*.log
+*.bak
+*.bak.*
+
+# 04-make-sdcard.ps1 在这两个位置找源文件，但它们都是 Buildroot 的产出，不进仓库。
+# 只精确匹配这四个名字，别写成 *.scr —— scripts/boot0-sd-first*.scr 是要保留的。
+/MLO
+/u-boot.img
+/dt.dtb
+/boot.scr
+/scripts/MLO
+/scripts/u-boot.img
+/scripts/dt.dtb
+/scripts/boot.scr
+
+# Python / 编辑器
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store

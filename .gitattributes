@@ -1,0 +1,5 @@
+# 仓库里统一存 LF。脚本要在 Linux 上跑，ps1 在 Windows 上跑 LF 也没问题。
+* text=auto eol=lf
+
+# .scr 是 mkimage 产出的二进制启动脚本，别做换行转换
+*.scr -text
