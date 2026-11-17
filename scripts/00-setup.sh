@@ -105,6 +105,22 @@ fi
 # ---------------------------------------------------------------- 建环境
 ubmc_need_root
 
+# 这套流程只对 Debian 系成立：debootstrap + apt。
+if [ ! -f /etc/debian_version ]; then
+	cat >&2 <<'EOF'
+
+这个脚本只能在 Debian / Ubuntu / Proxmox VE 上跑 —— 它用 debootstrap 建
+Debian stretch chroot，用 apt 装依赖。
+
+别的发行版（RHEL / Fedora / Arch）上有两条路：
+  1. 开一台 Debian 12 的虚拟机（或用 WSL），在里面跑
+  2. 手工建一个 stretch rootfs（debootstrap 在多数发行版仓库里也有），
+     然后把 UBMC_CHROOT 指过去，跳过本脚本，直接跑 01-build.sh
+
+EOF
+	exit 1
+fi
+
 say "配置"
 ubmc_show_env
 

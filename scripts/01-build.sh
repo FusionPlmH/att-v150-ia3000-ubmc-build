@@ -45,8 +45,14 @@ echo "=== build start $(date -Is) ===" | tee -a "$UBMC_LOG"
 ubmc_mount_chroot
 
 set +e
-# shellcheck disable=SC2086
-ubmc_make ${JOBS:+-j"$JOBS"} "${TARGETS[@]}" 2>&1 | tee -a "$UBMC_LOG"
+# bash 4.2 在 set -u 下展开空数组会报 unbound，所以要分开写
+if [ "${#TARGETS[@]}" -gt 0 ]; then
+	# shellcheck disable=SC2086
+	ubmc_make ${JOBS:+-j"$JOBS"} "${TARGETS[@]}" 2>&1 | tee -a "$UBMC_LOG"
+else
+	# shellcheck disable=SC2086
+	ubmc_make ${JOBS:+-j"$JOBS"} 2>&1 | tee -a "$UBMC_LOG"
+fi
 rc=${PIPESTATUS[0]}
 set -e
 
