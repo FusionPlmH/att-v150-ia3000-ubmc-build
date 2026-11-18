@@ -191,6 +191,32 @@ is_upgrade.sh -t fw-upgrade -v 0
 - 只有 bank 1 上原来的旧版被覆盖，所以动手前先 `cp -a` 留底
 - 这条路**完全不碰 U-Boot**
 
+### 回滚的前提与陷阱
+
+回滚是**纯标志驱动**的，没有任何健康检查。所以：
+
+| 情况 | 结果 |
+|---|---|
+| 新固件挂死 → 断电重上电 | ✅ 回滚 bank 0 |
+| 新固件能起，但没清 upgrade flag，之后正常重启 | ⚠️ **也回滚** |
+| 新固件能起，且清了 upgrade flag | 停在 bank 1 |
+
+想留在 bank 1，起来后**必须**手动清：
+
+```sh
+is_upgrade.sh -t fw-upgrade -v 0    # 只清 upgrade，保持 boot=1
+```
+
+**不要用 `is_upgrade.sh -c`**（见上文，`clear_flags()` 会把 boot 也清成 0）。
+
+「硬 reset」= 整个 V150 断电重上电 —— uBMC 是独立 SoC，待机供电，
+按前面板 reset 未必能把它复位，拔电最保险。
+
+> 原厂 U-Boot 的默认 env 里是 `silent=1`（`include/configs/ubmc335x.h:152`），
+> 所以串口看不到 `Booting from bank 1` 这类 U-Boot 打印；
+> 但 `boot1.scr` 里的 `console=ttyS0,115200n8` 会让内核日志正常输出，
+> 足以判断走到了哪一步。
+
 ## 实测数据（ATT V150 出厂机）
 
 ```
