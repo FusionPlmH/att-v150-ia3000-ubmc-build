@@ -90,7 +90,8 @@ lib/modules/4.14.54/kernel/drivers/i2c/busses/ubmc-ipmi-slave.ko
 ```
 
 出厂给 sshd 特权分离用户用了独立家目录 `/var/empty`，自编译是 `/`。
-**属于安全加固上的小退步**，可改。
+**属于安全加固上的小退步** —— ✅ **已在最终固件里修正**：把 `/etc/passwd`
+改回 `:/var/empty:/bin/false`，现在除 root 一行外与出厂 `/etc/passwd` 完全一致。
 
 ### `/etc/group` —— **完全相同**
 
@@ -225,7 +226,7 @@ usr/lib{,32}/sa                           sysstat 装在 /usr/lib 而非 /usr/li
 | 🟡 **版本落后** | OpenSSL 无 1.1.1、glib −1 小版本、net-snmp 单版本、libcurl/libssh 旧 |
 | 🟡 **源码落后** | 1.1.0.5-BETA vs 1.2.0.8，出厂版是内部分支，**无法从公开源追平** |
 | 🟢 平台适配 | `S35is_ipmi` 缺 SKY-D-CC 分支（本机用不到） |
-| 🟢 安全小退步 | sshd 家目录 `/var/empty` → `/` |
+| ✅ 已修正 | sshd 家目录已改回 `/var/empty`，`/etc/passwd` 除 root 行外与出厂一致 |
 
 ### 判断
 
