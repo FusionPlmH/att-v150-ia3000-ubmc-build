@@ -40,17 +40,47 @@ commit 590c7d7fe15d06a4d708403d3234bcd01cd039e1
 ### 它做的事
 
 ```
-1. git clone --depth 1 --branch v2017.01 u-boot
-   源顺序：git.u-boot-project.org → github.com/u-boot/u-boot（自动回退）
+1. git clone --depth 1 --branch ti-u-boot-2017.01
+   https://github.com/TexasInstruments/ti-u-boot
+   （回退到 git.ti.com）
 
 2. 依次打 product/ubmc/hardware/ti/uboot/patches/uboot-*.patch（11 个）
 
 3. 改名为 Buildroot 期望的
    u-boot-2017.01+gitAUTOINC+590c7d7fe1-g590c7d7fe1
 
-4. tar cjf 到 buildroot/dl/   ← Buildroot 的下载缓存目录
+4. tar czf 到 buildroot/dl/   ← Buildroot 的下载缓存目录
 
 5. rm -rf buildroot/output/build/uboot-custom   ← 清掉之前的失败状态
+```
+
+### ★ 基线必须是 TI 的分支，不是 vanilla u-boot
+
+这是本项目最容易踩的坑。三个候选里只有第三个能用：
+
+| 基线 | 结果 | 原因 |
+|---|---|---|
+| vanilla `v2017.01` | ✗ | 没有 `include/environment/ti/mmc.h`（v2017.05 才加）→ 编到一半 fatal error |
+| vanilla `v2017.09` | ✗ | 结构体成员改名（`cm0ioctl`/`dt0ioctl` → 新版名字），`ddr.c` 补丁上下文对不上 |
+| **TI `ti-u-boot-2017.01`** | **✓ 11/11 补丁干净应用** | 版本号写 `2017.01`、有 `mmc.h`、有 `dpll_ddr3_303MHz`/`HS_DEVICE`、**且保留 `cm0ioctl`** |
+
+TI 的这个分支 = 2017.01 基础 + TI 自己后期补的板级增强，
+正好是 Silicom/Meganet 打那 11 个补丁时用的基线。
+
+验证方法：
+
+```sh
+cd src
+grep -c 'define HS_DEVICE' arch/arm/include/asm/omap_common.h   # 应为 1
+grep -c 'cm0ioctl'          arch/arm/include/asm/arch-am33xx/ddr_defs.h  # 应为 >0
+ls include/environment/ti/                                      # 应有 mmc.h
+sed -n '4,6p' Makefile                                          # VERSION=2017 PATCHLEVEL=01
+```
+
+打完补丁后**不应该有 `.rej` 文件**：
+
+```sh
+find . -name '*.rej'    # 必须为空
 ```
 
 ### 输出长这样
@@ -82,7 +112,11 @@ tar cjf "$DL/$NAME.tar.gz" --exclude=.git "$NAME"
 
 ---
 
-## 三个编译坑
+## 三个编译坑（用 vanilla 基线时才会遇到）
+
+> ★ 用 **TI `ti-u-boot-2017.01` 分支**（见上面「基线必须是 TI 的分支」）时，
+> 这三个坑都**不会出现** —— 因为厂商基线本来就带着这些修复。
+> 只有退回去用 vanilla u-boot 才需要手工处理。
 
 编 `ubmc335x_install_defconfig`（UBMC-SD-INSTALL）时踩到的，全部已修。
 
@@ -140,6 +174,110 @@ apt-get install -y device-tree-compiler    # dtc 还是要的
 | `boot.scr` | 538 B | 编译后的启动脚本 |
 
 `MLO` 是 **SPL**（第一阶段），由 ROM 直接加载；`u-boot.img` 是完整的 U-Boot。
+
+---
+
+## 编 SD / install 版 U-Boot（`CONFIG_UMBC_SD_UBOOT`）
+
+Silicom 官方支持从 SD 卡启动，靠的是 U-Boot 的一个编译开关。
+这是**测试自编译固件最安全的路径**：eMMC 里的原厂固件完全不动，拔卡即回。
+
+### 两套 defconfig 的区别
+
+| defconfig | `CONFIG_UMBC_SD_UBOOT` | 行为 |
+|---|---|---|
+| `ubmc335x_defconfig` | 未设（生产版） | 探测 eMMC 号 → `mmcdev=<emmc>`，`mmcbank=0/1`，读 `boot0.scr`/`boot1.scr` |
+| **`ubmc335x_install_defconfig`** | **`=y`** | `mmcdev=0`（SD），`mmcbank=""`，读 `boot.scr` |
+
+源码 `uboot-0003-boot_fix.patch`：
+
+```c
+#if defined(CONFIG_UMBC_SD_UBOOT)
+	setenv("mmcdev", "0");
+	setenv("mmcbank", "");
+#else
+	... 探测 eMMC、读 bank 标志位 ...
+#endif
+	setenv("bootcmd", "run loadbootscript; run bootscript;");
+```
+
+配套脚本 `product/ubmc/hardware/ti/uboot/scripts/boot-sd.txt`：
+
+```
+fatload mmc 0:1 0x88000000 /dt.dtb
+fatload mmc 0:1 0x82000000 /zImage
+fatload mmc 0:1 0x88080000 /rootfs.cpio.uboot
+setenv bootargs console=ttyS0,115200n8 root=/dev/ram0 rw
+bootz 0x82000000 0x88080000 0x88000000
+```
+
+### 构建步骤（实测通过）
+
+```sh
+cd <TI 源码树>
+cp product/ubmc/hardware/ti/uboot/configs/ubmc335x_install_defconfig configs/
+
+export PATH=<buildroot>/output/host/bin:$PATH
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ubmc335x_install_defconfig
+
+# 跳过 pylibfdt 的 python 绑定（buildroot 的 host python2.7 缺 libpython2.7.so）
+mkdir -p tools && touch tools/_libfdt.so tools/libfdt.py
+
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j16
+```
+
+确认配置：
+
+```
+CONFIG_ARM=y
+CONFIG_CPU_V7=y
+CONFIG_TARGET_UBMC335X=y
+CONFIG_SYS_BOARD="ubmc335x"
+CONFIG_UMBC_SD_UBOOT=y          ← 关键
+```
+
+### 验证产物真的是 SD 版
+
+生产分支的字符串在 SD 版里必须**消失**：
+
+```sh
+strings -a MLO u-boot.img | grep -E 'Failed to get emmc device|Booting from bank'
+# 无输出 = SD 版正确
+```
+
+出厂固件（生产版）里这两条都在。这条判据比 `build_sd_install.sh` 里那个
+`grep bootcmd | grep fatload` 更可靠 —— 因为 SD 版的 `bootcmd` 其实是
+`run loadbootscript; run bootscript;`，本身不含 `fatload`。
+
+架构确认：
+
+```sh
+arm-linux-gnueabihf-readelf -A spl/u-boot-spl | grep Tag_CPU
+#   Tag_CPU_name: "7-A"
+#   Tag_CPU_arch: v7
+```
+
+### 实测产物对照
+
+| | 出厂（生产版） | 我们（SD 版） |
+|---|---|---|
+| `MLO` | 60,228 | 59,864 |
+| `u-boot.img` | 435,668 | 432,452 |
+| `dt.dtb` | `23c76bca…` | **`23c76bca…` 完全一致** |
+
+`dt.dtb` 哈希与出厂逐字节相同，说明设备树构建是忠实的。
+
+### SD 卡布局（`product/ubmc/scripts/upgrade/sdcard_env`）
+
+```
+MBR，单分区：FAT，起始 1 MiB，大小 1 GiB，boot 标志
+根目录放：MLO / u-boot.img / boot.scr / dt.dtb / zImage / rootfs.cpio.uboot
+```
+
+再把 SD 版 `MLO` + `u-boot.img` 刷进 eMMC 的 FAT 分区（p1），
+保留原厂 `boot0.scr`/`boot1.scr` 不动 —— 拔卡后刷回生产版 U-Boot 即可恢复。
+
+完整操作步骤见 `../silicom-att-v150-sd/README-SD-BOOT.md`。
 
 ---
 

@@ -23,9 +23,10 @@ SRC_DIR="$UBMC_WORK/uboot-src"
 TARBALL="$DL/$NAME.tar.gz"
 
 UPSTREAM=(
-	https://git.u-boot-project.org/u-boot/u-boot.git
-	https://github.com/u-boot/u-boot.git
+	https://github.com/TexasInstruments/ti-u-boot.git
+	https://git.ti.com/ti-u-boot/ti-u-boot.git
 )
+UPSTREAM_BRANCH=ti-u-boot-2017.01
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 for a in "$@"; do
@@ -42,18 +43,23 @@ echo "  输出       $TARBALL"
 mkdir -p "$DL" "$UBMC_WORK"
 
 echo
-echo '=== 1. 取 u-boot v2017.01 ==='
+echo '=== 1. 取 TI ti-u-boot-2017.01 分支 ==='
+# ★ 必须是 TI 的分支，不能是 vanilla u-boot：
+#   - vanilla v2017.01 缺 include/environment/ti/mmc.h（v2017.05 才加）
+#   - vanilla v2017.09 结构体改名（cm0ioctl 等），11 个补丁上下文对不上
+#   - TI 的 ti-u-boot-2017.01 版本号写 2017.01、有 mmc.h、有 dpll_ddr3_303MHz，
+#     且保留 cm0ioctl —— 正是 Silicom 打补丁时用的基线
 rm -rf "$SRC_DIR"
 for url in "${UPSTREAM[@]}"; do
-	echo "  尝试 $url"
-	if timeout 600 git clone --depth 1 --branch v2017.01 "$url" "$SRC_DIR" 2>/dev/null; then
+	echo "  尝试 $url ($UPSTREAM_BRANCH)"
+	if timeout 900 git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$url" "$SRC_DIR" 2>/dev/null; then
 		echo "  成功"
 		break
 	fi
 	rm -rf "$SRC_DIR"
 done
 [ -d "$SRC_DIR/.git" ] || { echo '所有上游源都失败，检查网络' >&2; exit 1; }
-( cd "$SRC_DIR" && echo "  当前: $(git describe --tags 2>/dev/null || echo v2017.01) $(git log --oneline -1)" )
+( cd "$SRC_DIR" && echo "  当前: $(git log --oneline -1)" )
 
 echo
 echo '=== 2. 依次打 vendor 补丁 ==='
