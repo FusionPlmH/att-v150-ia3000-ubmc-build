@@ -205,3 +205,96 @@ if fatload mmc 1:1 0x81000000 /boot0.scr.orig; then fatwrite mmc 1:1 0x81000000 
 
 另有 [scripts/press-setup-keys.ps1](scripts/press-setup-keys.ps1) ——
 在串口上轮换按固件 Setup 键（进 BIOS/固件菜单用）。
+
+---
+
+## 五、刷 U-Boot 时怎么把砖风险降到 0（AM3352 SD 启动）
+
+> 这一节针对「刷了 SD 版 U-Boot 之后起不来」。
+> 完整版见工作目录 `ubmc-sd-boot/RECOVERY.md`。
+
+### 5.1 关键结论：只刷 `u-boot.img`，**不要动 `MLO`**
+
+`board/silicom/ubmc335x/board.c` 里：
+
+```c
+#ifdef CONFIG_BOARD_LATE_INIT
+void board_late_init(void)          /* ← 第 509 行 */
+{
+    ...
+    board_get_boot_info();          /* ← 第 562 行，SD/生产的分支在这里 */
+    return 0;
+}
+#endif
+```
+
+整个函数被 `#if !defined(CONFIG_SPL_BUILD)` 包住 → **SPL 里不执行**。
+也就是说 `mmcdev` 由 U-Boot proper 决定，原厂 SPL 照样能加载我们编的 `u-boot.img`。
+
+> 出厂 `MLO` 里也能 `strings` 出 `Booting from bank`，只是因为
+> `silicom_autoboot.c` 被 `#include` 进 `board.c`、SPL 也编译了这段 —— 但那是**死代码**。
+
+**只换 `u-boot.img` ⇒ ROM 永远能找到合法 MLO ⇒ ROM 级的砖不会发生。**
+
+### 5.2 「砖」分四级，只有最末一级要动硬件
+
+| 级别 | 现象 | 谁还活着 | 怎么救 |
+|---|---|---|---|
+| **L1** | 串口有 `U-Boot ... =>` 提示符 | U-Boot 完整 | 直接敲命令 |
+| **L2** | 串口静默，但发 `reset` 能看到 SPL banner | U-Boot（`silent=1`）| 盲发命令 |
+| **L3** | 只有 `U-Boot SPL ...` 之后卡住 | SPL | 串口确认 + 重刷 u-boot.img |
+| **L4** | 完全无输出 | 只有 ROM | SYSBOOT 硬件救援 |
+
+> 我们编的 U-Boot 已把 `silent=1` 改成 `silent=0`，所以 **L2 不会再出现**。
+
+### 5.3 刷前必做：回读校验
+
+```sh
+mount /dev/mmcblk0p1 /mnt/p1
+cp /mnt/p1/u-boot.img /mnt/p1/u-boot.img.prod      # 备份
+cp /tmp/u-boot.img /mnt/p1/u-boot.img.new
+sync
+sha256sum /tmp/u-boot.img /mnt/p1/u-boot.img.new   # 两个必须一致
+mv /mnt/p1/u-boot.img     /mnt/p1/u-boot.img.orig
+mv /mnt/p1/u-boot.img.new /mnt/p1/u-boot.img
+sync; sha256sum /mnt/p1/u-boot.img; umount /mnt/p1
+```
+
+**回读校验过了再重启。** 这一步排除了「写坏」的全部可能。
+
+### 5.4 L1 恢复命令（串口提示符下）
+
+```
+# 恢复原厂 u-boot.img
+fatload mmc 1:1 0x81000000 /u-boot.img.prod
+fatwrite mmc 1:1 0x81000000 u-boot.img $filesize
+reset
+
+# 或直接从 eMMC 正常启动（不插 SD）
+ext2load mmc 1:2 0x88000000 /dt.dtb
+ext2load mmc 1:2 0x82000000 /zImage
+ext2load mmc 1:2 0x88080000 /rootfs.cpio.uboot
+setenv bootargs console=ttyS0,115200n8 root=/dev/ram0 rw loglevel=7
+bootz 0x82000000 0x88080000 0x88000000
+```
+
+设备号：**`mmc 0` = SD，`mmc 1` = eMMC**（U-Boot 与 Linux 相反）。
+`fatwrite` 的文件名**不能带开头斜杠**，否则 FAT 根目录留非法目录项。
+
+### 5.5 L4（ROM 级）硬件救援
+
+只有换过 `MLO` 才可能到这里。
+
+```
+devmem 0x44E10040      # = 0x0040031C
+                       # SYSBOOT[4:0] = 0b11100 → 只选 MMC1 (eMMC)
+```
+
+SYSBOOT 由板上**电阻分压**决定（不是拨码开关），改它要动烙铁：
+
+| 路线 | SYSBOOT[4:0] | 做法 |
+|---|---|---|
+| UART 启动 | `0b00100` | ROM 从 UART0 用 XMODEM 收 SPL，TI `uart-boot` 发 MLO 到 RAM，再重写 eMMC |
+| USB 启动 | `0b00011` | ROM 从 USB0 收 SPL，`usb-boot` 工具 |
+
+最后手段是把 BGA 封装的 eMMC 拆下来用编程器写回全盘镜像。
