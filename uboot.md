@@ -267,6 +267,40 @@ arm-linux-gnueabihf-readelf -A spl/u-boot-spl | grep Tag_CPU
 
 `dt.dtb` 哈希与出厂逐字节相同，说明设备树构建是忠实的。
 
+### ★ 为什么「只刷 `u-boot.img`」就足够切到 SD 启动
+
+`CONFIG_UMBC_SD_UBOOT` 影响两处，但只有一处在 SPL 里：
+
+| 位置 | 作用 | 编译进 |
+|---|---|---|
+| `silicom_autoboot.c:19` | `mmcdev=0`、`mmcbank=""` | **只在 U-Boot proper**（被 `board_late_init()` 调用，而该函数整体在 `#if !defined(CONFIG_SPL_BUILD)` 内）|
+| `board.c:730` | `board_mmc_init()` 初始化 SD 或 eMMC | **SPL 和 proper 都编译**，但只有 SPL 真正调用 |
+
+关键在本板 **`CONFIG_SPL_OF_CONTROL` 未开**：
+
+| 阶段 | MMC 枚举方式 | `board_mmc_init()` 是否起作用 |
+|---|---|---|
+| SPL (`MLO`) | 非 DM，`cur_dev_num++` 只注册一个控制器 | ✅ 起作用 → 原厂 MLO 只认 eMMC |
+| U-Boot proper | `CONFIG_DM_MMC=y`，驱动模型遍历 DT：`&mmc1`(SD)=0、`&mmc2`(eMMC)=1 | ❌ 死代码 |
+
+所以只要**保留原厂 `MLO`**（它保证从 eMMC p1 加载 `u-boot.img`），
+把 SD 版 `u-boot.img` 写进 eMMC p1 即可：
+
+```
+ROM → eMMC p1 MLO(原厂) → 从 eMMC p1 加载 u-boot.img(我们)
+      → mmcdev=0 → boot.scr 从 SD p1 读 → 内核/根文件系统全从 SD 读
+```
+
+U-Boot proper 里两张卡始终都在（`mmc 0`=SD、`mmc 1`=eMMC），
+所以出问题时 `fatwrite mmc 1:1 …` 依然能回写 eMMC。
+**代价为零，且 ROM 级砖（L4）不会发生。**
+
+反之，如果把 SD 版 `MLO` 也刷进 eMMC，SPL 就只初始化 SD ——
+一旦 SD 卡不在，连 U-Boot 都起不来。**不要那样做。**
+
+> `load mmc ${mmcdev} …` 没写分区号时默认取 **1**（`disk/part.c`：
+> `part == PART_UNSPECIFIED` → `part = 1`），所以 `load mmc 0` 读的是 SD 的 p1，不是整盘。
+
 ### SD 卡布局（`product/ubmc/scripts/upgrade/sdcard_env`）
 
 ```
@@ -274,10 +308,13 @@ MBR，单分区：FAT，起始 1 MiB，大小 1 GiB，boot 标志
 根目录放：MLO / u-boot.img / boot.scr / dt.dtb / zImage / rootfs.cpio.uboot
 ```
 
-再把 SD 版 `MLO` + `u-boot.img` 刷进 eMMC 的 FAT 分区（p1），
-保留原厂 `boot0.scr`/`boot1.scr` 不动 —— 拔卡后刷回生产版 U-Boot 即可恢复。
+`boot.scr` 全部用 `fatload mmc 0:1`，所以 6 个文件都放**同一个 FAT 分区**即可，
+不需要 ext4 分区。
 
-完整操作步骤见 `../silicom-att-v150-sd/README-SD-BOOT.md`。
+只把 SD 版 `u-boot.img` 刷进 eMMC 的 FAT 分区（p1），
+原厂 `MLO` / `boot0.scr` / `boot1.scr` 全部保留 —— 拔卡或刷回即恢复。
+
+完整操作步骤见工作目录的 `ubmc-sd-boot/README-SD-BOOT.md`（本文档同源）。
 
 ---
 
