@@ -144,6 +144,53 @@ AuthToken 后收到: 1/usr/bin/serial_socket_client (ubmc) / 2{ } / 0Press Ctrl+
 
 所以「我们的固件缺 IPMI 功能」这个担心可以排除 —— 能力面与原厂一致。
 
+## 登录与账号（踩过的坑）
+
+### is_admin 的密码在 /etc/shadow 里
+
+Web 登录校验读的是 **`/etc/shadow`**（不是插件里内嵌的哈希）。实测把
+`/etc/shadow` 里 `is_admin` 那行换成一个已知哈希后，用该密码登录立刻
+成功并下发 `sysauth` cookie。
+
+生成哈希（任意 Linux）：
+
+```sh
+python3 -c "import crypt; print(crypt.crypt('51L1C0M201B','\$6\$v150adm\$'))"
+```
+
+替换时要避开 shell 展开（`$6$...` 会被吃掉），用 awk 整行替换：
+
+```sh
+printf '%s\n' 'is_admin:$6$v150adm$...:20774:0:99999:7:::' > /tmp/newline.txt
+awk 'BEGIN{while((getline l<"/tmp/newline.txt")>0) nl=l} /^is_admin:/{print nl;next}{print}' \
+    /etc/shadow > /tmp/shadow.new && cp /tmp/shadow.new /etc/shadow && chmod 600 /etc/shadow
+```
+
+### privilege 在 mgmtd 配置里，不在 shadow
+
+```sh
+/usr/bin/lua -e 'package.cpath="/opt/silc-web/host/usr/lib/lua/?.so;"..package.cpath
+local c=require"mgmtdclient"; c.set_login("root",2,"local")
+print(c.query("/config/unix/user/is_admin/privilege"))'
+--> OK  3
+```
+
+`dispatcher.lua` 里 `PRIVILEGE_ADMIN = 2`，`check_normal()` 要求
+`user_privil >= 2`。`is_admin` 是 3，够用；**root 是 0，所以 root 打不开
+Console / Power / USB 这些页面**（但 RPC `/rpc/sys` 不受限，仍可提权）。
+
+### LuCI 的 stok 在 URL 路径里
+
+```
+对： /cgi-bin/sweb/;stok=<32位hex>/admin/bmc/shell
+错： /cgi-bin/sweb/admin/bmc/shell?stok=<32位hex>
+```
+
+### /etc/config/luci 缺失会导致所有 admin 页面打不开
+
+详见 [webtty-diagnosis.md](./webtty-diagnosis.md) 的「第二个坑」一节。
+`S46is_web_fw` 会在启动时兜底补齐。
+
 ## 硬件侧看到的东西
 
 ```

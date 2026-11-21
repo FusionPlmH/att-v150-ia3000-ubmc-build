@@ -138,32 +138,35 @@ done
 cp -a "$FACTORY/usr/share/snmp/mibs/SNMP-USM-HMAC-SHA2-MIB.txt" "$R/usr/share/snmp/mibs/"
 mkdir -p "$R/var/log/nginx"
 
-echo "=== 6.5 nginx 转发链的防火墙例外 ==="
-# ATT 的默认配置在 vrf-pub 上有兜底 "-I INPUT -i vrf-pub -j DROP"。
-# is_mgmtd 只用它自己的模板给后端端口 uhttpd:58080 补例外，其余 nginx
-# 相关端口全漏了 —— 7681（ttyd，Web Console 的 /ws 上游）和 80
-# （只做 301 跳转到 https）都被这条 DROP 吃掉。
-# 7681 沿用 58080 的做法（只放行源 MAC = vrf-pub 自身 MAC 的 hairpin），
-# 80 只回 301，允许外部访问。
+echo "=== 6.5 nginx 转发链与 Web UI 补丁 ==="
+# 1) 防火墙：vrf-pub 的兜底 DROP 缺 7681（ttyd）和 80（301 跳转）的例外
+# 2) /etc/config/luci：缺失时所有 /admin 页面都会 Authorization Required
 cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #!/bin/sh
 #
-# nginx 转发链所需的额外防火墙例外。
+# nginx 转发链与 Web UI 所需的补丁。
 #
-# ATT 的默认配置在 vrf-pub 上有一条兜底规则：
-#     -I INPUT -i vrf-pub -j DROP
-# is_mgmtd 建完这条规则后，只用它自己那个模板给后端端口 uhttpd:58080
-# 补例外，其余 nginx 相关端口全漏了：
+# 1) 防火墙例外
+#    ATT 的默认配置在 vrf-pub 上有一条兜底规则：
+#        -I INPUT -i vrf-pub -j DROP
+#    is_mgmtd 建完这条规则后，只用它自己那个模板给后端端口 uhttpd:58080
+#    补例外，其余 nginx 相关端口全漏了：
 #
-#   7681  ttyd —— nginx 的 /ws 上游（Web Console Shell）。
-#         nginx 从 vrf-pub 出去再绕回来（hairpin），源 MAC 是 vrf-pub
-#         自己的 MAC。缺例外 → /ws 永远握手不上，Console 页面一直转圈。
+#      7681  ttyd —— nginx 的 /ws 上游（Web Console Shell）。
+#            nginx 从 vrf-pub 出去再绕回来（hairpin），源 MAC 是 vrf-pub
+#            自己的 MAC。缺例外 → /ws 永远握手不上，Console 页面一直转圈。
 #
-#   80    nginx 的 HTTP 端口，只做 301 跳转到 https://。
-#         缺例外 → 浏览器打开 http://<bmc>/ 一直转圈而不跳转。
+#      80    nginx 的 HTTP 端口，只做 301 跳转到 https://。
+#            缺例外 → 浏览器打开 http://<bmc>/ 一直转圈而不跳转。
 #
-# 7681 沿用 58080 的做法：只放行「源 MAC = vrf-pub 自身 MAC」的流量，
-# 局域网直连 7681 仍然 DROP。80 只回一个 301，允许外部访问。
+#    7681 沿用 58080 的做法：只放行「源 MAC = vrf-pub 自身 MAC」的流量，
+#    局域网直连 7681 仍然 DROP。80 只回一个 301，允许外部访问。
+#
+# 2) LuCI 会话配置
+#    LuCI 把会话目录写在 /etc/config/luci 的 sauth.sessionpath 里，这个文件
+#    本应由 is_mgmtd 从 /opt/silc-web/host/etc/config/luci 复制过去。实测
+#    开机后可能不存在 —— 一旦缺失，登录能过但所有 /admin 页面都会返回
+#    "Authorization Required"，整个 Web UI（含 Console/Power/USB）全废。
 
 wait_mgmtd()
 {
@@ -218,11 +221,28 @@ allow_open()
     insert_accept "$1" "$2"
 }
 
+ensure_luci_config()
+{
+    tpl=/opt/silc-web/host/etc/config/luci
+    [ -f "${tpl}" ] || return 0
+    if [ ! -f /etc/config/luci ]; then
+        mkdir -p /etc/config
+        cp -a "${tpl}" /etc/config/luci
+    fi
+    spp=$(sed -n 's/^[ 	]*option[ 	]*sessionpath[ 	]*//p' /etc/config/luci |
+          head -1)
+    if [ -n "${spp}" ]; then
+        mkdir -p "${spp}"
+        chmod 700 "${spp}"
+    fi
+}
+
 case "$1" in
     start)
         wait_mgmtd
         allow_hairpin vrf-pub 7681
         allow_open    vrf-pub 80
+        ensure_luci_config
         ;;
     stop)
         vrf=vrf-pub

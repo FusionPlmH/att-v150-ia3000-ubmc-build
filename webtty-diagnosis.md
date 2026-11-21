@@ -166,6 +166,57 @@ VRF 确实是这台机器的网络架构（`vrf-ib=100 / vrf-ib-vlan=200 / vrf-p
 另外 `ss -tln` 对**纯绑定**的 ttyd 也显示 `0.0.0.0%vrf-pub:7681`，
 所以不能用 `%vrf-x` 来判断进程是否真在 VRF 里 —— 这一点曾误导过诊断。
 
+## 第二个坑：登录能过，但所有 /admin 页面都 Authorization Required
+
+症状：账号密码没错，响应里也确实下发了 `sysauth` cookie，但
+`/admin/bmc/shell`、`/admin/bmc/power`、`/admin/bmc/usb` 全部返回
+2,877 B 的 "Authorization Required" 页面。
+
+根因：**`/etc/config/luci` 不存在**（整个 `/etc/config` 目录都没有）。
+
+```
+LuCI sauth.lua:26
+    sessionpath = luci.config.sauth.sessionpath
+```
+
+`sessionpath` 来自 `/etc/config/luci` 的 `config internal sauth` 段：
+
+```
+config internal sauth
+	option sessionpath /tmp/silc-web-sessions
+	option sessiontime 900
+	option defaultuser "is_admin"
+```
+
+这个文件本应由 `is_mgmtd` 从 `/opt/silc-web/host/etc/config/luci` 复制过去
+（`strings is_mgmtd` 里这两个路径都在），但实测重启后它可能不存在。
+一旦缺失，`sessionpath` 为 nil，会话写不进去，于是每个 `/admin` 页面都
+判定未认证。
+
+顺带记一个 LuCI 的 HTTP 细节：**`stok` 是放在 URL 路径里的，不是查询参数**。
+
+```
+对： /cgi-bin/sweb/;stok=<32位hex>/admin/bmc/shell
+错： /cgi-bin/sweb/admin/bmc/shell?stok=<32位hex>
+```
+
+`Set-Cookie` 里那个 `path=/cgi-bin/sweb/;stok=...` 就是暗示。用 curl 复现
+浏览器行为时踩了这个坑很久。
+
+修复：`S46is_web_fw` 里加了 `ensure_luci_config()` —— 文件不存在就从模板
+复制，并按 `sessionpath` 建好目录（0700）。
+
+验证：补上之后同样用 `is_admin` 登录，各页面大小立刻正常：
+
+```
+shell      200  343,642 B   ← AuthToken + xterm 终端
+power      200   12,988 B
+usb        200   15,811 B
+console    200   54,838 B   h2 "Host Console"
+eventlog   200   18,516 B
+index      200   17,727 B
+```
+
 ## 修复
 
 新增 `etc/init.d/S46is_web_fw`，按 58080 的同一套路补两类例外：
@@ -189,7 +240,8 @@ iptables -I INPUT <pub-drop 位置> -i vrf-pub -p tcp --dport 80 -j ACCEPT
 2. **用 `iptables -C` 判重**，脚本可重复执行。
 3. **等 `/tmp/mgmtd_started`** 再动手，保证 mgmtd 的规则已经就位。
 4. 提供 `stop` 可完整撤销。
-5. 不需要 VRF 包装、不需要改 `is_mgmtd` 二进制、不需要改 nginx 配置。
+5. **兜底补 `/etc/config/luci`** 并建好会话目录（见上一节）。
+6. 不需要 VRF 包装、不需要改 `is_mgmtd` 二进制、不需要改 nginx 配置。
 
 脚本在 `scripts/rebuild-image.sh` 的「6.5」节内嵌生成，
 打包时自动安装并 `sh -n` 校验。
