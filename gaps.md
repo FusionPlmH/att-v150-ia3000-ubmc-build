@@ -6,7 +6,8 @@
 结论先行：
 
 - **库层面零缺失** —— 1,191 个 ELF 扫下来，未解析的 NEEDED **0 种**
-- **真正的功能缺口只剩两个**：REST API / Redfish、IPMI over LAN
+- **REST API / Redfish 已补齐**（第四轮，本机实测 200）
+- 真正的功能缺口只剩一个：**IPMI over LAN**
 - 其余 39 项全是厂商专用、死文件或冗余路径
 
 ## 一、接口层面（Web/CLI 的后端能力）
@@ -39,32 +40,52 @@
 
 全量清单对比：原厂 7,368 / 我们 7,331，缺 46 项。
 
-### 🟡 A. REST API / Redfish —— 唯一真正的功能缺口（11 个文件）
+### ✅ A. REST API / Redfish —— 第四轮已补齐
+
+原先缺 11 个文件，现在从出厂移植并接通：
 
 ```
 opt/silc-web/host/usr/lib/lua/luci/restapi.lua          346 行
 opt/silc-web/host/usr/lib/lua/luci/redfish.lua          488 行
-opt/silc-web/host/usr/lib/lua/luci/restapi/accounts.lua
-opt/silc-web/host/usr/lib/lua/luci/restapi/product.lua
-opt/silc-web/host/usr/lib/lua/luci/restapi/root.lua
-opt/silc-web/host/usr/lib/lua/luci/restapi/system.lua
-opt/silc-web/host/www/restapi                            （软链 + 静态资源）
+opt/silc-web/host/usr/lib/lua/luci/restapi/{root,system,accounts,product}.lua
+opt/silc-web/host/usr/lib/lua/luci/http/protocol.lua    换出厂版
+opt/silc-web/host/usr/lib/lua/luci/dispatcher.lua       加 http_auth + 分流
 ```
 
-**不能只拷文件**：`dispatcher.lua` 要加 `/restapi` 与 `/redfish` 分派，
-而这两个 Lua 依赖 `http_auth()` / `uri` / `context` 等自编译版 dispatcher
-里没有的辅助函数。
+**踩到两个坑**：
 
-影响面：只影响**程序化 API**。Web UI、Console、Power、USB CDROM、IPMI(KCS)、
-SNMP、CLI、JSON-RPC 全都不经过它。
+1. **路由从来没接上** —— 出厂的 `www/restapi` 是个 CGI 脚本，但 uhttpd
+   默认只把 `/cgi-bin` 当 CGI。实测在 docroot 根目录放可执行脚本，
+   请求它会**把源码当静态文件吐出来**，不会执行。所以 `/restapi` 一直是死的。
+2. **上游自己把 REST 关了** —— `restapi/product.lua` 里 vendor 判断被注释掉：
 
-现状实测（本机）：
+   ```lua
+   --if string.find(vendor, 'SILICOM') == nil then
+       for k, v in pairs(root_dict) do root_dict[k] = nil end
+       return
+   --end
+   ```
+
+   `customize()` 于是无条件清空整棵 REST 树，每个请求都是 404。
+
+**做法**：`dispatcher.lua` 按路径首段分流（比原厂按 `REQUEST_URI` 前缀更稳），
+`S46is_web_fw` 在 mgmtd 生成的 nginx.conf 里补两条 location，
+`product.lua` 改成放行，可选依赖用 `pcall` 包起来（缺 `cjson` 也不会
+拖垮整个 Web UI）。
+
+**实测**：
 
 ```
-https://<bmc>/restapi/v1/   -> 404
-https://<bmc>/redfish/v1/   -> 404
-https://<bmc>/rpc/sys       -> 可用（且能被提权成 root）
+GET /restapi/v1/config/system   无认证 -> 401
+GET /restapi/v1/config/system   认证后 -> 200（完整系统配置 JSON）
+GET /restapi/v1/status/system   认证后 -> 200（会话列表）
+GET /restapi/v1                 认证后 -> 403（顶层不允许）
+GET /redfish/v1                 认证后 -> 200（标准 ServiceRoot）
+GET /redfish/v1/Manager         认证后 -> 200（含真实时间）
+GET /redfish/v1/Chassis/Members/0/Power -> 200
 ```
+
+认证用 HTTP Basic + PAM 账号（`is_admin` / `51L1C0M201B`）。
 
 ### ⚪ B. 厂商专用（不影响本机，22 个文件）
 
@@ -163,17 +184,16 @@ ABI 限制了上限：内核 4.14.54、glibc 2.27、Buildroot 2018.02（2019 EOL
 | 库（NEEDED） | 0 | ✅ 全解析 |
 | 接口（插件） | 0 | ✅ 73 = 73 |
 | 接口（mgmtd 本体） | 3 | ⚪ 无人调用，无影响 |
-| REST API / Redfish | 11 文件 | 🟡 **真缺口**，仅影响程序化 API |
-| IPMI over LAN | — | 🟡 **真缺口**，需自己实现 |
+| REST API / Redfish | 0 | ✅ **第四轮补齐并实测** |
+| IPMI over LAN | — | 🟡 **唯一剩余的真缺口**，需自己实现 |
 | 厂商专用（CREANORD/phonehome/bmc-fan） | 22 文件 | ⚪ 本机用不到 |
 | 死文件 / 冗余 | 12 文件 | ⚪ 无引用 |
 
 ## 七、还不算「缺」但可以做的优化
 
-1. **REST/Redfish 移植** —— 主要工作在 `dispatcher.lua`。做完就有
-   `/restapi/v1/*` 和 `/redfish/v1/*`，可以用 Redfish 客户端管理。
+1. ~~**REST/Redfish 移植**~~ —— 已完成。
 2. **IPMI over LAN** —— 独立工程量，但做出来后 `ipmitool` 生态全通。
 3. **`S46is_web_fw` 上游化** —— 如果能改 mgmtd 源码，把 7681/80 的防火墙
-   例外交给它自己的模板生成，init 脚本就可以去掉。
-4. **杀掉 `i` 系列冗余** —— 出厂遗留的 .35 库和 `usr/lib64/sa` 可以清掉，
+   例外和 restapi/redfish 路由都交给它自己的模板生成，init 脚本就可以去掉。
+4. **杀掉冗余** —— 出厂遗留的 .35 库和 `usr/lib64/sa` 可以清掉，
    省 ~6 MB，但收益不大。

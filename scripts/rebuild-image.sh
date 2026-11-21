@@ -141,6 +141,7 @@ mkdir -p "$R/var/log/nginx"
 echo "=== 6.5 nginx 转发链与 Web UI 补丁 ==="
 # 1) 防火墙：vrf-pub 的兜底 DROP 缺 7681（ttyd）和 80（301 跳转）的例外
 # 2) /etc/config/luci：缺失时所有 /admin 页面都会 Authorization Required
+# 3) nginx 路由：把 /restapi 与 /redfish 接到可用的 CGI 上
 cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #!/bin/sh
 #
@@ -167,6 +168,12 @@ cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #    本应由 is_mgmtd 从 /opt/silc-web/host/etc/config/luci 复制过去。实测
 #    开机后可能不存在 —— 一旦缺失，登录能过但所有 /admin 页面都会返回
 #    "Authorization Required"，整个 Web UI（含 Console/Power/USB）全废。
+#
+# 3) REST / Redfish 路由
+#    出厂的 www/restapi 是个 CGI 脚本，但 uhttpd 默认只把 /cgi-bin 当 CGI，
+#    放在 docroot 根目录的脚本只会被当静态文件下载 —— 所以 /restapi 从来
+#    没通过。这里在 mgmtd 生成的 nginx.conf 里补两条 location，把标准路径
+#    映射到已经能工作的 /cgi-bin/sweb/<api>。
 
 wait_mgmtd()
 {
@@ -237,12 +244,47 @@ ensure_luci_config()
     fi
 }
 
+# 把 /restapi 和 /redfish 接到已经可用的 /cgi-bin/sweb/<api> 上
+enable_api_routes()
+{
+    conf=/etc/nginx/nginx.conf
+    [ -f "${conf}" ] || return 0
+    grep -q 'ubmc-api-routes' "${conf}" && return 0
+    grep -q 'location.*/ws' "${conf}" || return 0
+
+    tmp=/tmp/nginx.conf.api
+    cp -a "${conf}" "${tmp}"
+    awk '
+        !done && index($0, "location") > 0 && index($0, "/ws") > 0 {
+            print "        # ubmc-api-routes"
+            print "        location ^~ /restapi {"
+            print "            proxy_pass http://0.0.0.0:58080/cgi-bin/sweb/restapi;"
+            print "        }"
+            print "        location ^~ /redfish {"
+            print "            proxy_pass http://0.0.0.0:58080/cgi-bin/sweb/redfish;"
+            print "        }"
+            done = 1
+        }
+        { print }
+    ' "${tmp}" > "${conf}.new"
+
+    if /usr/sbin/nginx -t -c "${conf}.new" >/dev/null 2>&1; then
+        mv -f "${conf}.new" "${conf}"
+        for pid in $(pidof nginx); do
+            kill -HUP ${pid} 2>/dev/null
+        done
+    else
+        rm -f "${conf}.new"
+    fi
+}
+
 case "$1" in
     start)
         wait_mgmtd
         allow_hairpin vrf-pub 7681
         allow_open    vrf-pub 80
         ensure_luci_config
+        enable_api_routes
         ;;
     stop)
         vrf=vrf-pub
@@ -264,6 +306,199 @@ WEBFW
 chmod 755 "$R/etc/init.d/S46is_web_fw"
 sh -n "$R/etc/init.d/S46is_web_fw"
 echo "    已安装 S46is_web_fw"
+echo "=== 6.6 REST / Redfish ==="
+# 出厂的 www/restapi 是个 CGI 脚本，但 uhttpd 只把 /cgi-bin 当 CGI，放在
+# docroot 根目录的脚本只会被当静态文件下载 —— 所以 /restapi 从来没通过。
+# 这里的做法：把 Lua 实现搬过来，dispatcher 按路径首段分流，
+# 再由 S46is_web_fw 在 nginx 里补 /restapi、/redfish 两条 location。
+LR=opt/silc-web/host/usr/lib/lua/luci
+mkdir -p "$R/$LR/restapi"
+for f in restapi.lua redfish.lua http/protocol.lua \
+         restapi/root.lua restapi/system.lua restapi/accounts.lua restapi/product.lua ; do
+    cp -a "$FACTORY/$LR/$f" "$R/$LR/$f"
+done
+
+# 出厂把 vendor 判断注释掉了，customize() 会无条件清空整棵 REST 树，
+# 结果每个 /restapi 请求都是 404。这里改成放行。
+cat > "$R/$LR/restapi/product.lua" <<'RESTPROD'
+module("luci.restapi.product",  package.seeall)
+
+-- Upstream shipped this with the vendor guard commented out:
+--
+--   --if string.find(vendor, 'SILICOM') == nil then
+--       for k, v in pairs(root_dict) do root_dict[k] = nil end
+--       return
+--   --end
+--
+-- so customize() wiped the whole REST tree unconditionally and every
+-- /restapi request answered 404.  Keep the tree intact instead --
+-- /etc/product/vendor is empty on the ATT-V150 anyway, so the original
+-- "SILICOM only" test would have disabled the API here too.
+
+function customize(root_dict)
+end
+RESTPROD
+
+python3 - "$R/$LR/dispatcher.lua" <<'DISPATCH'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+
+# A: 顶部 require
+a = 'local nixio = require "nixio", require "nixio.util"\n'
+assert s.count(a) == 1, ('A', s.count(a))
+s = s.replace(a, a +
+    '-- optional: a missing cjson/cpath must not take the whole web UI down\n'
+    'local api_ok_redfish, redfish = pcall(require, "luci.redfish")\n'
+    'local api_ok_restapi, restapi = pcall(require, "luci.restapi")\n', 1)
+
+# B: 把 pam 认证拆出来，并加 HTTP Basic 认证
+start = 'function authenticator.pam_htmlauth(validator, accs, default)'
+endm = '\tluci.template.render("sysauth", {duser=default, fuser=user})\n\treturn false\n\nend\n'
+i = s.index(start)
+j = s.index(endm, i) + len(endm)
+assert 'pam.authenticate' in s[i:j] and len(s[i:j]) < 1400
+new = r'''-- base64 -> string, used by http_auth below
+function from_base64(data)
+	local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+	data = string.gsub(data, '[^'..b..'=]', '')
+	return (data:gsub('.', function(x)
+		if (x == '=') then return '' end
+		local r,f='',(b:find(x)-1)
+		for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+		return r
+	end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+		if (#x ~= 8) then return '' end
+		local c=0
+		for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+		return string.char(c)
+	end))
+end
+
+function pam_auth(user, pass)
+	if user and pass then
+		ret, pam_user, user_privil, proto = pam.authenticate(user, pass)
+		if ret == "OK" then
+			if user_privil == "null" then
+				local path
+				if proto == "radius" then
+					path = "/config/radius/static/privilege"
+				else
+					path = "/config/unix/user/" .. pam_user.."/privilege"
+				end
+				ret, user_privil = mgmtdclient.query(path)
+				if ret ~= "OK" then
+					user_privil = "0"
+				end
+			end
+			context.logname = user
+			context.user_privil = tonumber(user_privil)
+			context.auth_proto = proto
+			return true
+		end
+	end
+	return false
+end
+
+function authenticator.pam_htmlauth(validator, accs, default)
+	local user = luci.http.formvalue("username")
+	local pass = luci.http.formvalue("password")
+
+	local auth_pass = pam_auth(user, pass)
+	if auth_pass then
+		if not util.contains(accs, user) then
+			util.append(accs, user)
+		end
+		require "nixio"
+		nixio.syslog("notice", "Web login as user " .. user)
+		return user
+	end
+
+	require("luci.i18n")
+	require("luci.template")
+	context.path = {}
+	luci.template.render("sysauth", {duser=default, fuser=user})
+	return false
+
+end
+
+-- HTTP Basic auth for the programmatic APIs (/restapi, /redfish)
+function http_auth(request)
+	local auth = request:getenv("HTTP_AUTHORIZATION") or ""
+	if auth ~= "" then
+		local exist = string.find(auth, "^Basic %w+[=]?")
+		if exist ~= nil then
+			local token = string.gsub(auth, "Basic ", "")
+			local userpasswd = from_base64(token)
+			local user, pass
+			for k, v in string.gmatch(userpasswd, "([%w_]+):([%w_]+)") do
+				user = k
+				pass = v
+				break
+			end
+			if pam_auth(user, pass) then
+				return true
+			end
+		end
+	end
+	luci.http.status(401, "Unauthorized")
+	luci.http.header("WWW-Authenticate", "Basic realm='ubmc'")
+	return false
+end
+'''
+s = s[:i] + new + s[j:]
+
+# C: httpdispatch 里按路径首段分流
+old_c = '''	local stat, err = util.coxpcall(function()
+		dispatch(context.request)
+	end, error500)
+
+	luci.http.close()
+'''
+assert s.count(old_c) == 1, ('C', s.count(old_c))
+new_c = '''	-- programmatic APIs: /restapi/... and /redfish/...
+	-- reached either directly (nginx maps /restapi -> /cgi-bin/sweb/restapi)
+	-- or as /cgi-bin/sweb/restapi/...
+	local api = r[1]
+	if (api == "restapi" and api_ok_restapi) or
+	   (api == "redfish" and api_ok_redfish) then
+		if http_auth(request) then
+			local uri = "/" .. table.concat(r, "/")
+			local method = request:getenv("REQUEST_METHOD") or "GET"
+			local stat, err = util.coxpcall(function()
+				if api == "restapi" then
+					restapi.handle_request(request, context, uri)
+				elseif method == "GET" then
+					redfish.handle_get(uri)
+				elseif method == "POST" then
+					redfish.handle_post(uri, http.formvalue(), http.content(), context)
+				elseif method == "PATCH" then
+					redfish.handle_patch(uri, http.formvalue(), http.content(), context)
+				elseif method == "DELETE" then
+					redfish.handle_delete(uri, http.formvalue(), http.content(), context)
+				else
+					redfish.handle_get(uri)
+				end
+			end, error500)
+		end
+		luci.http.close()
+		return
+	end
+
+	local stat, err = util.coxpcall(function()
+		dispatch(context.request)
+	end, error500)
+
+	luci.http.close()
+'''
+s = s.replace(old_c, new_c, 1)
+
+open(p, 'w').write(s)
+print("    dispatcher 已打补丁")
+DISPATCH
+
+echo "    REST/Redfish 已接入"
+
 echo "=== 7. 清理并打包 ==="
 # init.d 必须是普通名字，rcS 在运行时会自己改成 IS_*
 for s in S49ntp S50sshd S50is_web S50nginx; do

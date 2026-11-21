@@ -179,7 +179,7 @@ mgmtdclient.delete("/config/unix/user/"..key)
 **用途**：Ansible `redfish` 模块、OpenStack sushy、VMware、各类 DCIM —
 不用学厂商私有接口就能纳管。
 
-## 五、缺 REST/Redfish 到底影响什么
+## 五、REST/Redfish 影响面
 
 这台机器所有**交互式**访问都不经过 REST/Redfish：
 
@@ -194,44 +194,85 @@ mgmtdclient.delete("/config/unix/user/"..key)
 
 所以缺的只是「给自动化平台用的标准接口」，不影响任何人工操作。
 
-## 六、自编译版的实际状态
+## 六、自编译版的实际状态（第四轮已补齐）
 
-| 组件 | 原版 | 自编译 |
+| 组件 | 原版 1.2.0.8 | 自编译（第四轮） |
 |---|---|---|
 | Web UI (LuCI) | ✅ | ✅ |
 | RPC (`/rpc/*`) | ✅ **有提权洞** | ✅ **同样有提权洞** |
-| REST API (`/restapi`) | ✅ | ❌ 404 |
-| Redfish (`/redfish`) | ✅ | ❌ 404 |
+| REST API (`/restapi`) | ❌ 文件在但路由没接、且被 product.lua 关掉 | ✅ **200** |
+| Redfish (`/redfish`) | ❌ 文件在但路由没接 | ✅ **200** |
 
 公开源码 `silicom-ltd/uBMC` 里就没有 `restapi.lua` / `redfish.lua`，
 属于厂家内部新增。
 
-### 为什么不能只拷文件
+### 接通过程踩到的两个坑
 
-`dispatcher.lua` 里需要加分派：
+**坑一：路由从来没接上。**
 
-```lua
-local restapi = require "luci.restapi"
-local redfish = require "luci.redfish"
-...
-elseif pre == "/restapi" then
-    local authorization = http_auth(request)
-    if authorization then
-        restapi.handle_request(request, context, uri)
-    end
-elseif pre == "/redfish" then
-    local authorization = http_auth(request)
-    if authorization then
-        local method = request:getenv("REQUEST_METHOD")
-        if method == "GET" then redfish.handle_get(uri)
-        elseif method == "POST" then redfish.handle_post(uri, http.formvalue(), http.content(), context)
-        elseif method == "PATCH" then redfish.handle_patch(...)
-        elseif method == "DELETE" then redfish.handle_delete(...)
-        end
-    end
+出厂的 `www/restapi` 是个 169 字节的 CGI 脚本（`dofile setup.lua` +
+`luci.sgi.cgi.run()`），放在 docroot 根目录。但 uhttpd 的 CGI 前缀默认
+只有 `/cgi-bin`，启动命令也没带 `-x`。实测在 docroot 根放一个可执行脚本：
+
+```
+GET /zztestcgi  ->  200, Content-Type: application/octet-stream
+                    返回的是脚本源码本身
 ```
 
-还依赖 `http_auth()`、`uri`、`context` 等工厂版 dispatcher 才有的辅助函数，
-自编译版的 dispatcher.lua 里没有（1046 行 vs 原版 1154 行）。
+**不会被当 CGI 执行，只会被当静态文件下载。** 所以 `/restapi` 一直是死的。
 
-**盲改会让整个 Web UI 挂掉** —— 必须真机验证后才能合入。
+**坑二：上游把 REST 自己关了。**
+
+`restapi/product.lua`：
+
+```lua
+function customize(root_dict)
+    -- disable restapi for other vendors
+    --if string.find(vendor, 'SILICOM') == nil then
+        for k, v in pairs(root_dict) do root_dict[k] = nil end
+        return
+    --end
+end
+```
+
+那个 `if` 被注释掉了，于是 `customize()` **无条件清空整棵 REST 树**，
+每个请求都是 404。而 `/etc/product/vendor` 在本机是空的 —— 就算把判断
+恢复，`SILICOM` 也匹配不上，照样关掉。
+
+### 我们的做法
+
+1. dispatcher **按路径首段分流**（`r[1] == "restapi"/"redfish"`），
+   比原厂按 `REQUEST_URI` 前缀判断更稳：无论从 `/restapi/...` 还是
+   `/cgi-bin/sweb/restapi/...` 进来都能工作。
+2. `http_auth()` 用 HTTP Basic + PAM（重构出 `pam_auth()` 复用）。
+3. 顶层 `require` 用 `pcall` 包起来 —— 缺 `cjson` 这类可选依赖时，
+   只让 API 不可用，不会拖垮整个 Web UI（这个坑真踩过）。
+4. `S46is_web_fw` 在 mgmtd 生成的 `nginx.conf` 里补两条 location：
+
+```nginx
+location ^~ /restapi {
+    proxy_pass http://0.0.0.0:58080/cgi-bin/sweb/restapi;
+}
+location ^~ /redfish {
+    proxy_pass http://0.0.0.0:58080/cgi-bin/sweb/redfish;
+}
+```
+
+改完先 `nginx -t`，通过才 `kill -HUP` reload。
+
+5. `http/protocol.lua` 换成出厂版（补 PATCH/PUT/DELETE 的 body 解析
+   和 401 状态码）。
+
+### 实测
+
+```
+GET /restapi/v1/config/system   无认证 -> 401（带 WWW-Authenticate）
+GET /restapi/v1/config/system   认证后 -> 200，完整系统配置 JSON
+GET /restapi/v1/status/system   认证后 -> 200，会话列表
+GET /restapi/v1                 认证后 -> 403（顶层不允许访问）
+GET /redfish/v1                 认证后 -> 200，标准 ServiceRoot
+GET /redfish/v1/Manager         认证后 -> 200，含真实 Datetime
+GET /redfish/v1/Chassis/Members/0/Power -> 200
+```
+
+认证：`curl -k -u is_admin:51L1C0M201B https://<bmc>/redfish/v1`
