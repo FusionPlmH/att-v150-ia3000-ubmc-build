@@ -1,7 +1,49 @@
 # SOL（IPMI Serial Over LAN）实现方案
 
-结论：**可行，而且比预想的简单** —— 不需要抢串口设备，只要连 `is_console_manager`
-已有的分发 socket 即可，与 Web Console **天然共存**（已实测）。
+**已实现并实测通过。** 不需要抢串口设备，只要连 `is_console_manager` 已有的分发
+socket 即可，与 Web Console **天然共存**。
+
+实测（`scripts/ipmi-lan/ipmi-sol-raw-test.py`）：
+
+```
+Get Payload Activation Status  '0000000000'
+Get Payload Instance Info      '000000000000000000000000'
+Activate Payload (SOL)         code 0  maxout=128 port=623
+sending CR through SOL ...
+got 3 SOL packet(s), 94 host byte(s)
+    | USENEODDXTX0101USZZ01 login:
+Deactivate Payload             'ok'
+all SOL checks passed
+```
+
+同时 `/ws` 仍返回 101，Web Console 不受影响。
+
+## 实现时踩到的三个坑
+
+### A. 外层 payload 分发漏了 `PT_SOL`
+
+`handle_rmcp_plus()` 里是 `ptype = pkt[5] & 0x3f` 再 switch，SOL 的 0xC1 掩码后是
+0x01，但 switch 只写了 `case PT_IPMI`（0x00）→ SOL 包全落到 `default` 被丢掉，
+日志里只看到 `unhandled payload type 0x01`。
+
+### B. `freopen` 之后 stderr 变成全缓冲
+
+`daemonize()` 里 `freopen(LOG_FILE, "a", stderr)` 会给流套上**块缓冲**，于是启动日志
+4 KB 才刷一次 —— 表现为"日志文件是空的"，我还因此误读了几轮**旧进程留下的**日志。
+修法是 `setvbuf(stderr, NULL, _IONBF, 0)`。
+
+### C. 512 字节输出缓冲会丢主机数据
+
+主机一次输出 1.5 KB 启动横幅，缓冲只有 512 → `output buffer full, dropping host data`。
+改成 4 KB 且**读满就停止读取**（流式 socket 天然背压，内核队列不会丢），
+不再主动丢字节。
+
+### D. pyghmi 的 `Console` 在脚本里跑不起来
+
+`console.Console(...)` 的 `Session` 是事件驱动的，且依赖交互式 stdin；脚本里
+`sessioncontext` 一直是 `None`。测试改用 `Command` + 直接
+`ipmi_session.send_payload(payload_type=1)`，并在等待期间调用
+`Session.wait_for_rsp()` 泵 socket —— 否则收不到任何 SOL 包。
 
 ## 一、现有控制台链路（实测确认）
 

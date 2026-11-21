@@ -11,6 +11,9 @@
 | Get Chassis Status (0x00 0x01) | `ubmc_sys_ctrl.sh -q` |
 | Chassis Control (0x00 0x02) | `-f` / `-o` / `-c` / `-r` / `-s` |
 | Get/Set System Boot Options (0x00 0x08/0x09) | `/config/ipmi-boot-flags` |
+| Activate/Deactivate Payload (0x06 0x48/0x49) | SOL，连 `console_manager_socket` |
+| Payload Activation Status / Instance Info (0x06 0x4A/0x4B) | SOL 状态查询 |
+| **SOL 字符流**（载荷类型 0x01） | 双向桥接到 `/var/run/console_manager_socket` |
 | Get Device ID (0x06 0x01) | 静态 |
 | Get Sensor Reading (0x04 0x2D) | 实时读 `/sys/class/hwmon/*` |
 | Get SDR Repository Info / Reserve / Get SDR (0x0A 0x20/0x22/0x23) | 启动时按 hwmon 生成 SDR 仓库 |
@@ -77,11 +80,13 @@ bit5-0 = 长度（≤63）
 
 ## 尚未实现
 
-- **SOL**（`ipmitool sol activate`）—— 数据面需要把 RMCP+ payload type 1 桥接到
-  `/dev/ttyF0`。但那个设备当前被 `serial_socket_client`（ttyd/Web Console）独占，
-  两者要共存得先设计一个复用方案；Web 侧已经有完整控制台，所以先不做。
 - **`Get Sensor Reading Factors`**（0x04 0x23）—— 只有非线性传感器才需要，本机都是线性。
 - 传感器阈值只有 CPU 温度有（`_max`/`_crit`），风扇和 ADC 通道没有阈值可读。
+- **SOL 的 BREAK**：`/dev/console_manager_socket` 是流式 socket，无法表达串口 BREAK，
+  收到 `payload[3] & 0x10` 时只记日志不转发。`ipmitool sol activate` 的 BREAK 主要用于
+  进 BIOS setup，日常登录不受影响。
+- **SOL 没有 ACK 流控**：服务端按自己的节奏发（每包 ≤128 字符），不等待客户端 ACK
+  窗口。实测 pyghmi 收包完整；主机输出突发时靠流式 socket 背压保证不丢。
 
 未识别的 netfn/cmd 统一返回 `0xC1`（Invalid Command），不会挂住客户端。
 收到 `Get SDR` 的 6 字节请求时若长度不足会返回 `0xCC`，pyghmi 会自行改用 size=5 重试。

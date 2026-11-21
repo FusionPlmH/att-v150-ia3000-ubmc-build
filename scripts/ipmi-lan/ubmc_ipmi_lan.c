@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
@@ -43,6 +44,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -94,6 +96,16 @@ typedef struct {
     char     user[17];
     uint32_t out_seq;
     time_t   last;
+    struct sockaddr_in peer; /* last source address, needed for async SOL */
+    int      have_peer;
+    /* SOL: the console channel is a fan-out socket served by is_console_manager,
+     * so SOL just becomes one more client and does not disturb ttyd */
+    int      sol_cfd;        /* connected console socket, -1 when idle */
+    uint8_t  sol_tx_seq;     /* our outgoing packet sequence, 1..15 */
+    uint8_t  sol_ack_seq;    /* last client sequence we acknowledged */
+    uint8_t  sol_rx_seq;     /* last client sequence we accepted */
+    uint8_t  sol_outlen;
+    uint8_t  sol_outbuf[4096];
 } session_t;
 
 static session_t   g_sessions[MAX_SESSIONS];
@@ -347,6 +359,10 @@ static int host_power_is_on(void)
 
 #define NETFN_SENSOR    0x04
 #define NETFN_STORAGE   0x0A
+
+#define CONSOLE_SOCK    "/var/run/console_manager_socket"
+#define PT_SOL          0x01
+#define SOL_MAX_OUT     128         /* max characters we put in one packet */
 
 /* hwmon-backed sensor, rebuilt at startup so `ipmitool sensor` has an SDR */
 typedef struct {
@@ -798,6 +814,72 @@ static void boot_flags_save(void)
     fclose(f);
 }
 
+/* ------------------------------------------------------------ SOL control */
+
+static session_t *g_sol_owner;
+static int        g_ipmi_fd = -1;
+
+static void sol_deactivate(session_t *s);
+static void sol_flush(void);
+static void sol_pump(void);
+static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen);
+
+/*
+ * The host serial is multiplexed by is_console_manager: it reads /dev/ttyS1 and
+ * fans the bytes out over CONSOLE_SOCK, where every ttyd/serial_socket_client
+ * pair already connects.  Joining that as one more client gives SOL both read
+ * and write access without stealing bytes from the web console, and without
+ * touching /dev/ttyF0 (which is write-only and therefore useless for reading
+ * host output).
+ */
+static int sol_activate(session_t *s)
+{
+    struct sockaddr_un sa;
+    int fd, fl;
+
+    if (g_sol_owner != NULL && g_sol_owner != s)
+        return 0x80;                    /* payload already owned by a session */
+    if (s->sol_cfd >= 0)
+        return 0;                       /* already active for this session */
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        logmsg("sol: socket: %s", strerror(errno));
+        return 0x81;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", CONSOLE_SOCK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        logmsg("sol: connect %s: %s", CONSOLE_SOCK, strerror(errno));
+        close(fd);
+        return 0x81;                    /* "SOL is disabled" */
+    }
+    fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    s->sol_cfd   = fd;
+    s->sol_tx_seq = 1;
+    s->sol_ack_seq = 0;
+    s->sol_rx_seq = 0;
+    s->sol_outlen = 0;
+    g_sol_owner  = s;
+    logmsg("sol: activated for rm=%08x", s->rm_id);
+    return 0;
+}
+
+static void sol_deactivate(session_t *s)
+{
+    if (s->sol_cfd >= 0) {
+        close(s->sol_cfd);
+        s->sol_cfd = -1;
+        logmsg("sol: deactivated for rm=%08x", s->rm_id);
+    }
+    s->sol_outlen = 0;
+    if (g_sol_owner == s)
+        g_sol_owner = NULL;
+}
+
 static int dispatch_ipmi(const uint8_t *req, int reqlen,
                          uint8_t *rsp, int *rsplen, session_t *s)
 {
@@ -876,6 +958,55 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             rsp[n++] = 0x00;
             rsp[n++] = 0x00;
             break;
+
+        case 0x48: {                                /* Activate Payload */
+            int ptype, rc;
+
+            if ((reqlen - 7) < 1) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            ptype = req[6] & 0x0f;
+            if (ptype != PT_SOL || s == NULL) {
+                rsp[6] = 0x81;                      /* payload type unsupported */
+                break;
+            }
+            rc = sol_activate(s);
+            if (rc != 0) {
+                rsp[6] = (uint8_t)rc;
+                break;
+            }
+            rsp[n++] = 0x00; rsp[n++] = 0x00;       /* reserved / test mode */
+            rsp[n++] = 0x00; rsp[n++] = 0x00;
+            rsp[n++] = SOL_MAX_OUT; rsp[n++] = 0x00;    /* max outbound */
+            rsp[n++] = 0x40; rsp[n++] = 0x00;           /* max inbound */
+            rsp[n++] = (uint8_t)(IPMI_PORT & 0xff);     /* SOL lands on 623 */
+            rsp[n++] = (uint8_t)((IPMI_PORT >> 8) & 0xff);
+            rsp[n++] = 0x00; rsp[n++] = 0x00;           /* VLAN */
+            break;
+        }
+
+        case 0x49:                                  /* Deactivate Payload */
+            if (s != NULL)
+                sol_deactivate(s);
+            break;
+
+        case 0x4A:                                  /* Get Payload Activation Status */
+            rsp[n++] = (uint8_t)(g_sol_owner ? 0x01 : 0x00);
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+            break;
+
+        case 0x4B: {                                /* Get Payload Instance Info */
+            uint32_t id = g_sol_owner ? g_sol_owner->rm_id : 0;
+            rsp[n++] = (uint8_t)(id & 0xff);
+            rsp[n++] = (uint8_t)((id >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((id >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((id >> 24) & 0xff);
+            rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+            rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+            break;
+        }
 
         default:
             rsp[6] = CC_INVALID_CMD;
@@ -1297,6 +1428,8 @@ static session_t *by_rc_id(uint32_t id)
     return NULL;
 }
 
+static void drop_session(session_t *s);
+
 static session_t *alloc_session(void)
 {
     int i, oldest = 0;
@@ -1306,14 +1439,17 @@ static session_t *alloc_session(void)
         if (g_sessions[i].last < g_sessions[oldest].last)
             oldest = i;
     }
-    memset(&g_sessions[oldest], 0, sizeof(g_sessions[oldest]));
+    drop_session(&g_sessions[oldest]);
     return &g_sessions[oldest];
 }
 
 static void drop_session(session_t *s)
 {
-    if (s)
-        memset(s, 0, sizeof(*s));
+    if (!s)
+        return;
+    sol_deactivate(s);
+    memset(s, 0, sizeof(*s));
+    s->sol_cfd = -1;            /* 0 would look like an open descriptor */
 }
 
 /* ------------------------------------------------------------ RMCP+ in */
@@ -1356,6 +1492,7 @@ static void handle_open_request(int fd, const struct sockaddr_in *to,
         drop_session(s);
     s = alloc_session();
     memset(s, 0, sizeof(*s));
+    s->sol_cfd = -1;
     s->in_use = 1;
     s->rc_id  = rd_le32(pl + 4);
     s->rm_id  = ++g_next_id;
@@ -1513,25 +1650,170 @@ static void handle_rakp3(int fd, const struct sockaddr_in *to,
     send_plain(fd, to, PT_RAKP4, s->rm_id, 0, rsp, n);
 }
 
+/* wrap a payload into an encrypted, integrity protected RMCP+ packet */
+static void send_session_payload(int fd, const struct sockaddr_in *to,
+                                 session_t *s, uint8_t ptype,
+                                 const uint8_t *payload, int plen)
+{
+    uint8_t out[MAX_PKT], iv[16], mac[20], enc[MAX_PKT + 32];
+    uint8_t cipher[MAX_PKT + 32], *o;
+    int i, pad, enclen, n;
+
+    if (plen <= 0 || plen + 17 > (int)sizeof(enc)) {
+        logmsg("sol: payload too large (%d)", plen);
+        return;
+    }
+    pad = (plen + 1) % 16;
+    if (pad)
+        pad = 16 - pad;
+    memcpy(enc, payload, (size_t)plen);
+    for (i = 0; i < pad; i++)
+        enc[plen + i] = 0xff;
+    enc[plen + pad] = (uint8_t)pad;
+    enclen = plen + pad + 1;
+
+    rand_bytes(iv, 16);
+    aes_cbc(1, s->k2, iv, enc, enclen, cipher);
+
+    o = rmcp_plus_hdr(out, (uint8_t)(ptype | 0x40 | 0x80), s->rc_id,
+                      ++s->out_seq, 16 + enclen);
+    memcpy(o, iv, 16); o += 16;
+    memcpy(o, cipher, enclen); o += enclen;
+
+    n = (int)(o - out) - 2;                         /* exclude length field */
+    pad = n % 4;
+    if (pad)
+        pad = 4 - pad;
+    for (i = 0; i < pad; i++)
+        *o++ = 0xff;
+    *o++ = (uint8_t)pad;
+    *o++ = 0x07;
+    hmac_sha1(s->k1, 20, out + 4, (int)(o - out) - 4, mac);
+    memcpy(o, mac, AUTHCODE_LEN); o += AUTHCODE_LEN;
+    if (sendto(fd, out, (size_t)(o - out), 0,
+               (const struct sockaddr *)to, sizeof(*to)) < 0)
+        logmsg("sol: sendto(type %02x) failed: %s", ptype, strerror(errno));
+}
+
+/* drain the console socket into the per-session output buffer */
+static void sol_pump(void)
+{
+    session_t *s = g_sol_owner;
+    uint8_t buf[256];
+    int n;
+
+    if (s == NULL || s->sol_cfd < 0)
+        return;
+    for (;;) {
+        int room = (int)sizeof(s->sol_outbuf) - s->sol_outlen;
+
+        if (room <= 0)
+            return;                 /* full: stop reading, the stream socket
+                                     * provides the backpressure */
+        if (room > (int)sizeof(buf))
+            room = (int)sizeof(buf);
+        n = (int)read(s->sol_cfd, buf, (size_t)room);
+        if (n <= 0)
+            return;
+        memcpy(s->sol_outbuf + s->sol_outlen, buf, (size_t)n);
+        s->sol_outlen += n;
+    }
+}
+
+/* send whatever accumulated, as one SOL data packet */
+static void sol_flush(void)
+{
+    session_t *s = g_sol_owner;
+    uint8_t pl[4 + SOL_MAX_OUT + 8];
+    int len;
+
+    if (s == NULL || s->sol_cfd < 0 || s->sol_outlen <= 0)
+        return;
+    if (!s->have_peer)
+        return;
+
+    len = s->sol_outlen;
+    if (len > SOL_MAX_OUT)
+        len = SOL_MAX_OUT;
+
+    pl[0] = s->sol_tx_seq;
+    if (++s->sol_tx_seq == 0)
+        s->sol_tx_seq = 1;                          /* 0 is reserved for ACKs */
+    pl[1] = s->sol_ack_seq;
+    pl[2] = (uint8_t)len;
+    pl[3] = 0;
+    if (!host_power_is_on())
+        pl[3] |= 0x20;                              /* system power is off */
+    memcpy(pl + 4, s->sol_outbuf, (size_t)len);
+
+    send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, pl, 4 + len);
+    if (debug_on())
+        logmsg("sol: tx %d chars seq=%u ack=%u", len, pl[0], pl[1]);
+
+    if (len < s->sol_outlen) {
+        memmove(s->sol_outbuf, s->sol_outbuf + len,
+                (size_t)(s->sol_outlen - len));
+        s->sol_outlen -= len;
+    } else {
+        s->sol_outlen = 0;
+    }
+}
+
+/* a SOL packet from the client: characters in, acknowledgement out */
+static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen)
+{
+    uint8_t ack[4];
+    int seq, n;
+
+    if (plen < 4)
+        return;
+    seq = pl[0] & 0x0f;
+    if (debug_on())
+        logmsg("sol: rx seq=%d len=%d flags=%02x", seq, plen, pl[3]);
+
+    if (seq != 0 && seq != s->sol_rx_seq && plen > 4 && s->sol_cfd >= 0) {
+        s->sol_rx_seq = (uint8_t)seq;
+        n = (int)write(s->sol_cfd, pl + 4, (size_t)(plen - 4));
+        if (n < 0)
+            logmsg("sol: console write: %s", strerror(errno));
+    }
+    if (pl[3] & 0x10)
+        logmsg("sol: BREAK requested (not forwarded, unix socket cannot carry it)");
+
+    if (plen > 4)
+        s->sol_ack_seq = (uint8_t)seq;
+
+    ack[0] = 0;                                     /* no data, pure ACK */
+    ack[1] = (uint8_t)seq;
+    ack[2] = (uint8_t)(plen > 4 ? plen - 4 : 0);
+    ack[3] = 0;
+    if (s->have_peer)
+        send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, ack, 4);
+}
+
 static void handle_encapsulated(int fd, const struct sockaddr_in *to,
                                 const uint8_t *pkt, int len)
 {
-    uint8_t   rspmsg[MAX_PKT], plain[MAX_PKT], enc[MAX_PKT], cipher[MAX_PKT];
-    uint8_t   out[MAX_PKT], iv[16], mac[20], *o;
-    int       plen, i, flen, padlen, msglen, rlen = 0, pad, n;
+    uint8_t   rspmsg[MAX_PKT], plain[MAX_PKT], iv[16], mac[20];
+    int       plen, flen, padlen, msglen, rlen = 0;
+    uint8_t   ptype;
     uint32_t  sid;
     session_t *s;
 
     if (len < 16)
         return;
-    sid  = rd_le32(pkt + 6);
-    plen = pkt[14] | (pkt[15] << 8);
+    sid   = rd_le32(pkt + 6);
+    plen  = pkt[14] | (pkt[15] << 8);
+    ptype = (uint8_t)(pkt[5] & 0x3f);
 
     s = by_rm_id(sid);
     if (!s)
         return;
     if (16 + plen > len || plen < 17)
         return;
+
+    s->peer = *to;                                  /* remember for async SOL */
+    s->have_peer = 1;
 
     /* integrity: HMAC-SHA1-96 over everything after the RMCP header */
     if (len - 12 - 4 > 0) {
@@ -1559,42 +1841,17 @@ static void handle_encapsulated(int fd, const struct sockaddr_in *to,
     if (msglen <= 0)
         return;
 
+    if (ptype == PT_SOL) {
+        sol_recv_payload(s, plain, msglen);
+        s->last = time(NULL);
+        return;
+    }
+
     if (dispatch_ipmi(plain, msglen, rspmsg, &rlen, s) < 0) {
         logmsg("bad ipmi message");
         return;
     }
-
-    /* encrypt the reply */
-    pad = (rlen + 1) % 16;
-    if (pad)
-        pad = 16 - pad;
-    memcpy(enc, rspmsg, rlen);
-    for (i = 0; i < pad; i++)
-        enc[rlen + i] = 0xff;
-    enc[rlen + pad] = (uint8_t)pad;
-    {
-        int enclen = rlen + pad + 1;
-        rand_bytes(iv, 16);
-        aes_cbc(1, s->k2, iv, enc, enclen, cipher);
-
-        o = rmcp_plus_hdr(out, PT_IPMI | 0x40 | 0x80, s->rc_id,
-                          ++s->out_seq, 16 + enclen);
-        memcpy(o, iv, 16); o += 16;
-        memcpy(o, cipher, enclen); o += enclen;
-
-        n = (int)(o - out) - 2;                     /* exclude length field */
-        pad = n % 4;
-        if (pad)
-            pad = 4 - pad;
-        for (i = 0; i < pad; i++)
-            *o++ = 0xff;
-        *o++ = (uint8_t)pad;
-        *o++ = 0x07;
-        hmac_sha1(s->k1, 20, out + 4, (int)(o - out) - 4, mac);
-        memcpy(o, mac, AUTHCODE_LEN); o += AUTHCODE_LEN;
-        sendto(fd, out, (size_t)(o - out), 0,
-               (const struct sockaddr *)to, sizeof(*to));
-    }
+    send_session_payload(fd, to, s, PT_IPMI, rspmsg, rlen);
     s->last = time(NULL);
 }
 
@@ -1613,6 +1870,7 @@ static void handle_rmcp_plus(int fd, const struct sockaddr_in *to,
     case PT_RAKP1:    handle_rakp1(fd, to, pkt + 16, len - 16);        break;
     case PT_RAKP3:    handle_rakp3(fd, to, pkt + 16, len - 16);        break;
     case PT_IPMI:     handle_encapsulated(fd, to, pkt, len);           break;
+    case PT_SOL:      handle_encapsulated(fd, to, pkt, len);           break;
     default:
         logmsg("unhandled payload type 0x%02x", ptype);
         break;
@@ -1656,6 +1914,9 @@ static void daemonize(void)
             /* not fatal */
         }
     }
+    /* freopen() gives the stream default (block) buffering; without this the
+     * log only appears once 4 kB accumulate or the process exits */
+    setvbuf(stderr, NULL, _IONBF, 0);
     dup2(fileno(stderr), fileno(stdout));
 }
 
@@ -1737,6 +1998,8 @@ int main(int argc, char **argv)
     sdr_build();
     fru_build();
     boot_flags_load();
+    for (i = 0; i < MAX_SESSIONS; i++)
+        g_sessions[i].sol_cfd = -1;
 
     bindlist = getenv("IPMI_LAN_BIND");
     if (!bindlist)
@@ -1768,18 +2031,36 @@ int main(int argc, char **argv)
         logmsg("no listener could be created");
         return 1;
     }
+    g_ipmi_fd = fds[0];                 /* SOL replies go out this socket */
 
     while (!g_stop) {
         fd_set rfds;
         struct timeval tv;
-        int r;
+        int r, maxfd2 = maxfd;
 
         FD_ZERO(&rfds);
         for (i = 0; i < nfds; i++)
             FD_SET(fds[i], &rfds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (g_sol_owner != NULL && g_sol_owner->sol_cfd >= 0) {
+            FD_SET(g_sol_owner->sol_cfd, &rfds);
+            if (g_sol_owner->sol_cfd > maxfd2)
+                maxfd2 = g_sol_owner->sol_cfd;
+        }
+        /* a short tick while SOL is up keeps the character accumulate
+         * interval close to the IPMI default of 100 ms */
+        tv.tv_sec  = g_sol_owner ? 0 : 1;
+        tv.tv_usec = g_sol_owner ? 20000 : 0;
+        r = select(maxfd2 + 1, &rfds, NULL, NULL, &tv);
+        if (r < 0)
+            continue;
+
+        if (g_sol_owner != NULL && g_sol_owner->sol_cfd >= 0 &&
+            FD_ISSET(g_sol_owner->sol_cfd, &rfds)) {
+            sol_pump();
+            sol_flush();
+        } else if (g_sol_owner != NULL && r == 0) {
+            sol_flush();
+        }
         if (r <= 0)
             continue;
 
@@ -1815,3 +2096,4 @@ int main(int argc, char **argv)
     logmsg("stopping");
     return 0;
 }
+
