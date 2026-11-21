@@ -80,31 +80,94 @@ bit5-0 = 长度（≤63）
 
 ## 尚未实现
 
-- **`Get Sensor Reading Factors`**（0x04 0x23）—— 只有非线性传感器才需要，本机都是线性。
+- **LAN configuration parameters**（0x0C 0x02）—— 所以 `ipmitool lan print` 能跑通（会自己
+  打印 `not supported`），但读不到 IP/掩码/网关的值。要做需要把收包从 `recvfrom` 换成
+  `recvmsg` + `IP_PKTINFO` 拿到目的地址，再映射到接口。
+- **SHA-256 cipher suite（17/18/19）** —— python-ipmi（`ipmitool.py`）默认挑套件 17，会被
+  拒。用 `-o cipher=3` 指定套件 3 即可正常工作。
 - 传感器阈值只有 CPU 温度有（`_max`/`_crit`），风扇和 ADC 通道没有阈值可读。
-- **SOL 的 BREAK**：`/dev/console_manager_socket` 是流式 socket，无法表达串口 BREAK，
-  收到 `payload[3] & 0x10` 时只记日志不转发。`ipmitool sol activate` 的 BREAK 主要用于
-  进 BIOS setup，日常登录不受影响。
-- **SOL 没有 ACK 流控**：服务端按自己的节奏发（每包 ≤128 字符），不等待客户端 ACK
-  窗口。实测 pyghmi 收包完整；主机输出突发时靠流式 socket 背压保证不丢。
+- **主机 → 客户端的 BREAK 通知**：`payload[3] & 0x04`（"收到 BREAK"）不会置位。反向的
+  客户端 → 主机 BREAK（`payload[3] & 0x10`）已实现并实测可用。
+- 未实现 `Set LAN Config`、`Get/Set User Access`、IPMB 桥接、PEF、SDR 设备端写入。
 
 未识别的 netfn/cmd 统一返回 `0xC1`（Invalid Command），不会挂住客户端。
 收到 `Get SDR` 的 6 字节请求时若长度不足会返回 `0xCC`，pyghmi 会自行改用 size=5 重试。
 
+### SOL 的 BREAK（已实现）
+
+客户端在 SOL 头 `payload[3]` 置 bit4（0x10）即请求 BREAK。服务端另外 `open("/dev/ttyS1",
+O_WRONLY)` 后做 `TIOCSBRK`，250 ms 后 `TIOCCBRK` 释放。之所以能这么做：tty 的线路事件不
+要求独占读端，所以和 `is_console_manager` 的读并存不冲突。
+
+> ⚠️ **BREAK 会在主机内核上「武装」 SysRq**：实测 BREAK 之后主机打印
+> `sysrq: SysRq : HELP : loglevel(0-9) reboot(b) crash(c) ...`——即紧跟着发的那个字符被当成
+> SysRq 命令吃掉了。这是 Linux 串口控制台的固有行为（真实 BMC 也一样），但也意味着
+> **误发 BREAK 后随手按键可能触发 `b`（重启）或 `c`（crash）**。所以只在客户端明确请求时
+> 才发，且长度限制在 250 ms。
+
+### SOL 的 ACK 流控（已实现）
+
+滑动窗口，最多 4 包（`SOL_WINDOW`）在途，每包 ≤128 字符：
+
+- 客户端 ACK（`payload[1] & 0x0f`）到达 → 丢掉队列里该序号及其前面的包。
+- 1 s 没 ACK → 重传队首包，最多 3 次。
+- 如果客户端**从未** ACK 过，2 次重传后判定「这个客户端不 ACK」，置 `sol_noack` 退化成
+  无窗口直发——否则窗口会让整个控制台永久卡死。
+
+这条退化路径是实测出来的：最初只有纯窗口实现时，一个只发不收的客户端只拿到 652 字节
+（4 包 + 首包）就断流，拿不到 login 提示；加上退化后同样客户端能收全 1636 字节的完整横幅。
 
 只实现 cipher suite 3（HMAC-SHA1 认证 + HMAC-SHA1-96 完整性 + AES-CBC-128 加密）——
 这是 `ipmitool -I lanplus` 和 pyghmi 的默认组合。
+
+## 和其他客户端的兼容性修正
+
+这些都是拿两个独立客户端（pyghmi、python-ipmi）交叉验证时才暴露出来的：
+
+### ASF Presence Ping（RMCP class 6）
+
+真实 BMC 都会应答。python-ipmi 在连之前先发这个，不应答就直接报
+`no response to RMCP ping`。应答内容是 presence pong：IANA `00 00 11 BE`、类型 `0x40`、
+回显 tag、16 字节数据（`oem_iana=4542`、`oem_defined=0`、`supported_entities=0x80`（IPMI）、
+`interactions=0`）。
+
+### 保密性填充字节必须是 `0x01 0x02 0x03 ...`
+
+IPMI 规定填充字节内容 "don't care"，但 python-ipmi 会按规范示例**校验**它们是递增序列，
+填 `0xFF` 会报 `invalid confidentiality pad`。改成递增序列后 pyghmi 和 ipmitool 也照收。
+
+### `Close Session`（App 0x3C）
+
+不实现的话客户端每条命令都成功、最后断开时抛 `CompletionCodeError cc=0xC1`，退出码非 0。
+现在返回成功再拆会话。
+
+### FRU 空字段不能省略
+
+FRU 字段是**按位置**解析的。产品区的 Asset Tag 为空时我原来直接跳过，结果后面的
+FRU File ID 被当成 Asset Tag，再往后就越界崩在 `_decode_custom_fields`。空字段必须写成
+`0xC0`（类型 3、长度 0）。
+
+### `Get Channel Info`（App 0x42）
+
+`ipmitool lan print` 靠它找 802.3 LAN 通道。两个客户端都按
+`data[1] & 0x7F` 取介质类型（不是规范里写的高 4 位），响应共 9 个数据字节。
+只应答通道 1（以及 `0x0E`/`0x0F` 别名），其余返回 `0xCC` 让客户端跳过。
 
 ## 文件
 
 | 文件 | 用途 |
 |---|---|
-| `ubmc_ipmi_lan.c` | 守护进程（~1000 行，依赖 libcrypto） |
+| `ubmc_ipmi_lan.c` | 守护进程（~2200 行，依赖 libcrypto） |
 | `S47is_ipmi_lan` | init 脚本（start/stop/restart/status，带守护重启） |
 | `probe623.py` | 裸 UDP 探活：发一条合法的 IPMI 1.5 Get Channel Auth Capabilities |
 | `ipmi-client-test.py` | pyghmi 验收测试（RMCP+ 握手 + 电源） |
-| `ipmi-extras-test.py` | pyghmi 验收：SDR/传感器 / FRU / SEL / bootdev |
+| `ipmi-extras-test.py` | pyghmi 验收：SDR/传感器 / FRU / SEL / bootdev / Reading Factors |
+| `ipmi-sol-raw-test.py` | pyghmi 验收：SOL 数据通路（不 ACK 的客户端，验证退化路径） |
+| `ipmi-sol-flow-test.py` | pyghmi 验收：SOL 滑动窗口（ACK 的客户端）+ BREAK 转发 |
+| `conprobe.c` | 控制台 socket 探针，确认 `/var/run/console_manager_socket` 是双向 fan-out |
+| `brktest.c` | BREAK 可行性验证：另开 `/dev/ttyS1` 做 `TIOCSBRK` 是否可行 |
 | `apply-runtime.sh` | **不刷机**前提下在真机上部署/调试，仅在开发时用 |
+| `deploy-ipmi-lan.ps1` | 开发期把交叉编译产物经 Web RPC 推上真机并重启 |
 
 ## 凭据为什么单独存
 

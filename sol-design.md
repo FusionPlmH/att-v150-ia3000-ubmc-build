@@ -3,22 +3,27 @@
 **已实现并实测通过。** 不需要抢串口设备，只要连 `is_console_manager` 已有的分发
 socket 即可，与 Web Console **天然共存**。
 
-实测（`scripts/ipmi-lan/ipmi-sol-raw-test.py`）：
+实测（`scripts/ipmi-lan/ipmi-sol-raw-test.py`，一个只发不收、从不 ACK 的客户端）：
 
 ```
 Get Payload Activation Status  '0000000000'
 Get Payload Instance Info      '000000000000000000000000'
 Activate Payload (SOL)         code 0  maxout=128 port=623
 sending CR through SOL ...
-got 3 SOL packet(s), 94 host byte(s)
-    | USENEODDXTX0101USZZ01 login:
+got 17 SOL packet(s), 1636 host byte(s)
+    | *********...****************
+    |             USENEODDXTX0101USZZ01 login:
 Deactivate Payload             'ok'
 all SOL checks passed
 ```
 
 同时 `/ws` 仍返回 101，Web Console 不受影响。
 
-## 实现时踩到的三个坑
+`scripts/ipmi-lan/ipmi-sol-flow-test.py` 再验一遍**会 ACK** 的客户端（走滑动窗口，
+无重传、无重复序号）以及 **BREAK 转发**（日志出现 `sol: BREAK asserted for 250 ms`，
+之后控制台仍可用）。
+
+## 实现时踩到的四个坑
 
 ### A. 外层 payload 分发漏了 `PT_SOL`
 
@@ -258,3 +263,54 @@ con.close()
   第二个进程读会**抢走字节**，直接破坏 Web Console
 - `/dev/ttyF0` 是 `crw--w----`（只写），本来就是给"注入"用的，读不出主机输出
 - 所以只有 `console_manager_socket` 这条路既能读又能写，且天然多客户端
+
+## 八、BREAK 与 ACK 流控（后续补齐，均已实测）
+
+### 8.1 BREAK 怎么发出来的
+
+`console_manager_socket` 是流式 socket，**表达不了串口 BREAK**。但 BREAK 是 tty 的
+**线路事件**，不需要独占读端——所以额外 `open("/dev/ttyS1", O_WRONLY)`，只做
+`ioctl(TIOCSBRK)` / `ioctl(TIOCCBRK)` 是可行的，和 `is_console_manager` 的读并存不冲突
+（可行性先用 `scripts/ipmi-lan/brktest.c` 单独验证过）。
+
+```
+客户端置 payload[3] & 0x10
+  → sol_break_assert():  open /dev/ttyS1 O_WRONLY, TIOCSBRK, 记下释放时刻
+  → 主循环每轮 sol_break_service(): 到点后 TIOCCBRK 并关闭 fd
+```
+
+取 250 ms：足够长，主机侧能识别成 framing error；又足够短，不会把 SysRq 一直压住。
+
+> ⚠️ **BREAK 会在主机内核上「武装」 SysRq。** 实测 250 ms BREAK 之后，主机立刻打印
+> `sysrq: SysRq : HELP : loglevel(0-9) reboot(b) crash(c) ...`，也就是**紧跟着的那个字符
+> 被当成 SysRq 命令吃掉了**（我用 `\r` 试的，结果回车变成了"打印帮助"）。这是 Linux 串口
+> 控制台的固有行为，真实 BMC 一样，但也意味着**误发 BREAK 后随手按键可能触发 `b` 重启
+> 或 `c` crash**。所以只在客户端明确请求时才发。
+
+反方向（主机发出 BREAK → 通知客户端，`payload[3] & 0x04`）没有实现：需要在读
+`console_manager_socket` 时识别 BREAK 条件，而那个 socket 已经把线路事件抹掉了。
+
+### 8.2 ACK 滑动窗口
+
+```
+最多 SOL_WINDOW=4 包在途，每包 ≤ SOL_MAX_OUT=128 字符
+收到 ACK（payload[1] & 0x0f = 客户端最后收到的序号）→ 丢掉该序号及之前的包
+1 s 没 ACK（SOL_RETRY_MS）→ 重传队首，最多 SOL_MAX_TRIES=3 次
+```
+
+**关键：客户端不 ACK 时必须退化，否则控制台会永久卡死。**
+
+最初只实现了纯窗口，结果一个只发不收的客户端 6 秒内只拿到 652 字节（首包 + 4 包窗口）
+就断流，连 login 提示都看不到——因为窗口满了之后服务端一直在傻等 ACK。现在的做法是：
+如果这个客户端**从头到尾一个 ACK 都没发过**，重传 2 次后就置 `sol_noack = 1`，
+退化成无窗口直发（不再入队、不再重传）。同一条测试脚本立刻从 652 字节变成完整的
+1636 字节横幅 + `USENEODDXTX0101USZZ01 login:`。
+
+有 ACK 历史的客户端仍按 3 次重传后丢弃该包继续。
+
+### 8.3 一个测试自身的坑
+
+`ipmi-sol-flow-test.py` 第一版在 BREAK 之后复用 `seq=1` 发回车，服务端按重复包直接丢弃
+（`seq == sol_rx_seq` 就不写 console），表现为"BREAK 之后控制台死了"。真实客户端是递增
+序号的，改成 1..15 循环后即正常。
+

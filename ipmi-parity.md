@@ -21,8 +21,9 @@
 | BIOS 升级 / 备份 / 恢复 | ✅ | `/admin/bmc/bios` | `/action/bmc/bios/*` 端点 |
 | 系统事件日志 SEL | ✅ | `/admin/bmc/eventlog` | `/action/bmc/sel/clear`、`ubmc_ipmi_sel_prt` |
 | 硬件健康（风扇/温度/电压/电源） | ✅ | 无独立页面 | `/status/bmc/health/*` |
-| **IPMI over LAN**（`ipmitool -I lanplus` / Redfish 客户端） | ✅ | 自建 `ubmc_ipmi_lan`（udp/623，RMCP+ suite 3） | pyghmi 实测会话建立 + `get_power` + `set_power` |
-| IPMI `sel list` / `sensor` / `fru` / `sol` | ❌ | — | 服务端只实现 Chassis + Device ID |
+| **IPMI over LAN**（`ipmitool -I lanplus`） | ✅ | 自建 `ubmc_ipmi_lan`（udp/623，RMCP+ suite 3） | pyghmi + python-ipmi 双客户端实测 |
+| IPMI `sel list` / `sensor` / `fru` / `chassis bootdev` | ✅ | 同上 | 199 条 SEL、24 个传感器有值、完整 FRU、bootdev 读写往返 |
+| IPMI `sol activate` | ✅ | 同上（复用 console fan-out socket） | 完整 1636 字节横幅 + login 提示；BREAK 与 ACK 流控实测 |
 
 ## 各功能的实际入口
 
@@ -214,7 +215,7 @@ peci（device tree 里有节点）           Intel CPU 侧通道
 
 ## IPMI over LAN：已补齐（自建服务端）
 
-原厂没有 udp/623 监听者，第五轮自己实现了：
+原厂没有 udp/623 监听者，第五~七轮自己实现了完整的一套：
 
 ```
 usr/sbin/ubmc_ipmi_lan       IPMI 2.0 RMCP+ 服务端，cipher suite 3
@@ -222,29 +223,39 @@ etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
 /config/ipmi-lan.passwd      独立口令表（不能用 /etc/shadow，见下）
 ```
 
-命令映射：
+已实现的命令：
 
-- NetFn Chassis `0x01` Get Chassis Status → `ubmc_sys_ctrl.sh -q`
-- NetFn Chassis `0x02` Chassis Control → `-f` / `-o` / `-c` / `-r` / `-s`
-- NetFn App `0x01` Get Device ID → 静态
-- 未识别的 netfn/cmd → `0xC1`（Invalid Command）
+| NetFn | 命令 | 能力 |
+|---|---|---|
+| App | `0x01` `0x38` `0x3B` `0x3C` `0x3D` `0x42` | 设备信息、通道能力、特权级、关会话、通道信息 |
+| Chassis | `0x00` `0x01` `0x02` `0x08` `0x09` | 能力/状态、电源控制、boot flags 与 bootdev |
+| Storage | `0x10` `0x11` | FRU（读 EEPROM TlvInfo，拼 Board + Product 区）|
+| Storage | `0x20`-`0x23` `0x40` `0x42` `0x43` `0x47`-`0x49` | SDR 仓库、SEL 读写/清空、SEL 时间 |
+| Sensor | `0x2D` `0x23` | 传感器读数、Reading Factors |
+| App | `0x48`-`0x4B` + payload type 1 | **SOL**（含 BREAK 与 ACK 流控）|
+| RMCP class 6 | ASF presence ping → pong | 部分客户端握手前置 |
+
+电源命令映射到 `ubmc_sys_ctrl.sh -q/-f/-o/-c/-r/-s`；SEL 读的是厂商格式
+`/var/log/sel`（20 字节 × 200 槽循环缓冲）；传感器走 hwmon（`peci_cputemp`、
+`silc_fan`、`ads7830`）；FRU 读 i2c `0-0050` 的 ONIE TlvInfo EEPROM。
 
 口令为什么不能沿用 shadow：RAKP2/RAKP3 的认证码是**以明文口令为 HMAC 密钥**
 算的，单向哈希算不出来。真实 BMC 也都是单独存一份 IPMI 口令。
 
-实测（pyghmi）：
+实测（pyghmi 与 python-ipmi 两个独立客户端交叉验证，镜像里那颗 strip 后的二进制）：
 
 ```
-RMCP+ 会话建立（RAKP1-4）  通过
-get_power()                {'powerstate': 'on'}
-set_power('on')            已下发
+python-ipmi: bmc info / chassis status / sdr list / fru print / sel list / lan print  全部 rc=0
+pyghmi    : 电源、SEL+传感器+FRU+bootdev、SOL、SOL 流控+BREAK 四套验收全绿
+GET /ws   : 101（SOL 与 Web Console 并存）
 ```
 
-完整协议细节与四个排查坑见 [ipmi-lan.md](./ipmi-lan.md)。
+完整协议细节、踩坑与已知缺口见 [ipmi-lan.md](./ipmi-lan.md) 和
+[sol-design.md](./sol-design.md)。
 
-**还没实现**：SEL（`ipmitool sel list`）、SDR 传感器（`ipmitool sensor`）、
-FRU（`ipmitool fru`）、SOL（`ipmitool sol activate`）、`chassis bootdev`。
-这些在 Web UI 侧都有对应能力，只是没桥接到 IPMI 协议。
+**还没实现**（都不影响日常运维）：LAN configuration parameters（`lan print` 能跑但
+值是 `not supported`）、SHA-256 cipher suite（python-ipmi 需加 `-o cipher=3`）、
+主机→客户端方向的 BREAK 通知、Set LAN Config / User Access / IPMB 桥接 / PEF。
 
 ## 建议的使用方式
 

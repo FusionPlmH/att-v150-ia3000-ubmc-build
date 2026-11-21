@@ -89,6 +89,17 @@ def main():
         if len(log) < 100:
             FAILS.append("SEL record count looks low (%d)" % len(log))
 
+    # --------------------------------------------------------- reading factors
+    # Get Sensor Reading Factors (0x04 0x23) is what ipmitool's analog sensors
+    # path uses before reading a threshold sensor, so it must answer neatly.
+    section("Get Sensor Reading Factors  (0x04 0x23)")
+    for sid in (1, 2, 12):
+        rf = run("reading factors sensor %d" % sid,
+                 lambda sid=sid: bmc.raw_command(netfn=0x04, command=0x23,
+                                                 data=(sid,))["data"].hex())
+        if rf is not None:
+            print("    sensor %-3d %s" % (sid, rf))
+
     # ----------------------------------------------------------- boot options
     section("Chassis boot options  (ipmitool chassis bootdev)")
     bd = run("get_bootdev", bmc.get_bootdev)

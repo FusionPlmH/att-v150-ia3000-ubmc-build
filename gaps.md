@@ -1,13 +1,15 @@
-# 还缺什么（2026-11-21 第三轮后，实测数据）
+# 还缺什么（2026-11-21 第七轮后，实测数据）
 
-基线：`ubmc-bank1/rootfs.cpio.uboot` 第三轮版
-（54,311,469 B / `5b26f335…`），对比对象是出厂 1.2.0.8。
+基线：`ubmc-bank1/rootfs.cpio.uboot` 第七轮版
+（54,340,651 B / `650ec5a1…`），对比对象是出厂 1.2.0.8。
 
 结论先行：
 
 - **库层面零缺失** —— 1,191 个 ELF 扫下来，未解析的 NEEDED **0 种**
 - **REST API / Redfish 已补齐**（第四轮，本机实测 200）
-- **IPMI over LAN 已补齐**（第五轮，pyghmi 实测握手 + 电源控制全通）
+- **IPMI over LAN 已补齐**（第五~七轮）：RMCP+ 会话、电源控制、SEL、SDR/传感器、
+  FRU、bootdev、SOL（含 BREAK 与 ACK 流控）全部实测通过，pyghmi 与 python-ipmi
+  两个独立客户端交叉验证
 - 真正的功能缺口已经清零，其余 39 项全是厂商专用、死文件或冗余路径
 
 ## 一、接口层面（Web/CLI 的后端能力）
@@ -140,7 +142,7 @@ usr/lib64/sa/sa{1,2}, sadc            3 项   与 usr/lib/sa/ 重复（我们已
 批次一补的工具：valgrind 全套、`ntpq`、`ssh-copy-id`、`json2lua`/`lua2json`、
 `cjson.so`、SNMP SHA-2 MIB。
 
-## 四、IPMI over LAN（第五轮已补齐）
+## 四、IPMI over LAN（第五~七轮已补齐）
 
 原状态：**固件里根本没有**，不是「没移植」。
 
@@ -151,17 +153,28 @@ ss -uln   -> 只有 0.0.0.0:68（DHCP client），没有 623/udp
 
 现有 IPMI 是 **KCS-only**：`ubmc_ipmi` + `ubmc_ipmi_slave.ko`，只在主机 OS 内部可用。
 
-第五轮自己实现了 IPMI 2.0 RMCP+ 服务端（`ubmc_ipmi_lan`，cipher suite 3），
-把 Chassis 命令映射到 `ubmc_sys_ctrl.sh`。真机用 pyghmi 实测：
+自己实现了 IPMI 2.0 RMCP+ 服务端（`ubmc_ipmi_lan`，cipher suite 3）：
 
-```
-RMCP+ 会话建立（RAKP1-4）          通过
-get_power()                        {'powerstate': 'on'}
-Get Device ID / Chassis Caps/Status code 0
-set_power('on')                    已下发
-```
+| 能力 | 命令 | 实测客户端 |
+|---|---|---|
+| 会话 / 设备信息 | App 0x01/0x38/0x3B/0x3C/0x3D/0x42 | pyghmi、python-ipmi |
+| 电源控制 | Chassis 0x02/0x03 + 0x00/0x01 | pyghmi（`get_power` → `on`）|
+| SEL | Storage 0x40/0x42/0x43/0x47/0x48/0x49 | pyghmi 199 条、python-ipmi 2189 行 |
+| SDR / 传感器 | Storage 0x20/0x21/0x22/0x23 + Sensor 0x2D/0x23 | pyghmi 24 个有值、python-ipmi 逐个列全 |
+| FRU | Storage 0x10/0x11 | pyghmi `get_inventory`、python-ipmi `fru print` |
+| boot options | Chassis 0x08/0x09 | pyghmi 读写往返 |
+| SOL | App 0x48/0x49/0x4A/0x4B + payload type 1 | pyghmi（含 BREAK、ACK 流控）|
+| ASF presence ping | RMCP class 6 | python-ipmi（握手前置）|
 
-细节与踩坑见 [ipmi-lan.md](./ipmi-lan.md)。仍缺 SEL / SDR 传感器 / FRU / SOL / bootdev。
+细节与踩坑见 [ipmi-lan.md](./ipmi-lan.md) 和 [sol-design.md](./sol-design.md)。
+
+仍缺（都不影响日常运维）：
+
+- **LAN configuration parameters**（Transport 0x0C 0x02）—— `ipmitool lan print` 能跑通，
+  但 IP/掩码/网关会显示 `not supported`。要做需要 `recvmsg` + `IP_PKTINFO` 拿目的地址。
+- **SHA-256 cipher suite（17/18/19）** —— python-ipmi 默认挑 17，会被拒；加 `-o cipher=3` 即可。
+- **主机 → 客户端的 BREAK 通知**（`payload[3] & 0x04`）—— console socket 把线路事件抹掉了。
+- Set LAN Config / Get-Set User Access / IPMB 桥接 / PEF / SDR 写入。
 
 ## 五、组件版本陈旧（不是缺，但要知道）
 
@@ -190,7 +203,7 @@ ABI 限制了上限：内核 4.14.54、glibc 2.27、Buildroot 2018.02（2019 EOL
 | 接口（插件） | 0 | ✅ 73 = 73 |
 | 接口（mgmtd 本体） | 3 | ⚪ 无人调用，无影响 |
 | REST API / Redfish | 0 | ✅ **第四轮补齐并实测** |
-| IPMI over LAN | 0 | ✅ **第五轮补齐并实测**（SEL/SDR/FRU/SOL 仍未实现） |
+| IPMI over LAN | 0 | ✅ **第五~七轮补齐并实测**（含 SEL/SDR/FRU/SOL/BREAK/流控）|
 | 厂商专用（CREANORD/phonehome/bmc-fan） | 22 文件 | ⚪ 本机用不到 |
 | 死文件 / 冗余 | 12 文件 | ⚪ 无引用 |
 

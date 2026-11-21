@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -56,6 +57,18 @@
 #define MAX_USERS        16
 #define PASSWD_FILE      "/config/ipmi-lan.passwd"
 #define LOG_FILE         "/var/log/ipmi-lan.log"
+
+/* SOL */
+#define CONSOLE_SOCK    "/var/run/console_manager_socket"
+#define PT_SOL          0x01
+#define SOL_MAX_OUT     128         /* max characters we put in one packet */
+#define SOL_WINDOW      4           /* unacknowledged packets we keep around */
+#define SOL_RETRY_MS    1000
+#define SOL_MAX_TRIES   3
+#define HOST_UART       "/dev/ttyS1"
+#define SOL_BREAK_MS    250         /* long enough to be seen as a framing error,
+                                     * short enough that the host's SysRq does
+                                     * not pick up stray characters */
 
 #define PT_IPMI          0x00
 #define PT_OPEN_REQ      0x10
@@ -74,13 +87,20 @@
 
 /* RMCP+ open-session status codes we use */
 #define RMCP_OK                0x00
-#define RMCP_INSUFF_PRIV       0x0C
+#define RMCP_INVALID_AUTH_ALGO 0x03
 #define RMCP_INVALID_USER      0x0D
 
 typedef struct {
     char name[17];
     char pass[21];
 } ipmi_user_t;
+
+typedef struct {
+    uint8_t  data[SOL_MAX_OUT + 4];
+    int      len;            /* 0 = free slot */
+    uint8_t  seq;
+    uint8_t  tries;
+} sol_pkt_t;
 
 typedef struct {
     int      in_use;
@@ -98,14 +118,21 @@ typedef struct {
     time_t   last;
     struct sockaddr_in peer; /* last source address, needed for async SOL */
     int      have_peer;
+    int      close_pending;  /* Close Session seen: drop after the reply */
     /* SOL: the console channel is a fan-out socket served by is_console_manager,
      * so SOL just becomes one more client and does not disturb ttyd */
     int      sol_cfd;        /* connected console socket, -1 when idle */
     uint8_t  sol_tx_seq;     /* our outgoing packet sequence, 1..15 */
     uint8_t  sol_ack_seq;    /* last client sequence we acknowledged */
     uint8_t  sol_rx_seq;     /* last client sequence we accepted */
-    uint8_t  sol_outlen;
+    int      sol_outlen;
     uint8_t  sol_outbuf[4096];
+    /* sliding window, so a client that stops acknowledging cannot be flooded */
+    sol_pkt_t sol_inflight[SOL_WINDOW];
+    int       sol_ninflight;
+    long      sol_retry_ms;  /* when to retransmit sol_inflight[0] */
+    int       sol_acks_seen; /* client acknowledgements received so far */
+    int       sol_noack;     /* client never acks: stream without a window */
 } session_t;
 
 static session_t   g_sessions[MAX_SESSIONS];
@@ -359,10 +386,6 @@ static int host_power_is_on(void)
 
 #define NETFN_SENSOR    0x04
 #define NETFN_STORAGE   0x0A
-
-#define CONSOLE_SOCK    "/var/run/console_manager_socket"
-#define PT_SOL          0x01
-#define SOL_MAX_OUT     128         /* max characters we put in one packet */
 
 /* hwmon-backed sensor, rebuilt at startup so `ipmitool sensor` has an SDR */
 typedef struct {
@@ -695,17 +718,19 @@ static int fru_build_area(uint8_t *a, int with_date, int32_t minutes,
         a[5] = (uint8_t)((minutes >> 16) & 0xff);
     }
     for (i = 0; i < n; i++) {
-        int l;
-        if (tlvs[i].val == NULL || tlvs[i].val[0] == '\0')
-            continue;
-        l = (int)strlen(tlvs[i].val);
+        int l = 0;
+
+        if (tlvs[i].val != NULL)
+            l = (int)strlen(tlvs[i].val);
         if (l > 63)
             l = 63;
-        /* FRU fields pack the type (bits 7:6) and length (bits 5:0) into one
-         * byte; 0b11 = 8-bit ASCII + Latin1 */
+        /* FRU fields are positional, so an empty field still has to be emitted
+         * as a zero-length one: leaving it out shifts everything after it. */
         a[off++] = (uint8_t)(0xc0 | l);
-        memcpy(a + off, tlvs[i].val, (size_t)l);
-        off += l;
+        if (l) {
+            memcpy(a + off, tlvs[i].val, (size_t)l);
+            off += l;
+        }
     }
     a[off++] = 0xc1;                    /* end of list */
     total = off + 1;
@@ -818,11 +843,58 @@ static void boot_flags_save(void)
 
 static session_t *g_sol_owner;
 static int        g_ipmi_fd = -1;
+static int        g_break_fd = -1;      /* /dev/ttyS1, opened lazily for BREAK */
+static long       g_break_release_ms;
 
 static void sol_deactivate(session_t *s);
 static void sol_flush(void);
 static void sol_pump(void);
 static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen);
+static void sol_retransmit(void);
+static void sol_break_service(void);
+
+static long now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * A real serial BREAK: TIOCSBRK on the host UART.  Reading is unaffected by a
+ * write-only open, so is_console_manager keeps the console; this only pulls the
+ * line low for SOL_BREAK_MS.  Note the host kernel turns a BREAK into SysRq, so
+ * this fires the host's SysRq handler - exactly like a hardware BMC does.
+ */
+static void sol_break_assert(void)
+{
+    if (g_break_fd < 0) {
+        g_break_fd = open(HOST_UART, O_WRONLY | O_NOCTTY | O_NONBLOCK);
+        if (g_break_fd < 0) {
+            logmsg("sol: BREAK unavailable, open %s: %s", HOST_UART,
+                   strerror(errno));
+            return;
+        }
+    }
+    if (ioctl(g_break_fd, TIOCSBRK, 0) < 0) {
+        logmsg("sol: TIOCSBRK: %s", strerror(errno));
+        close(g_break_fd);
+        g_break_fd = -1;
+        return;
+    }
+    g_break_release_ms = now_ms() + SOL_BREAK_MS;
+    logmsg("sol: BREAK asserted for %d ms", SOL_BREAK_MS);
+}
+
+static void sol_break_service(void)
+{
+    if (g_break_release_ms == 0 || now_ms() < g_break_release_ms)
+        return;
+    if (g_break_fd >= 0)
+        ioctl(g_break_fd, TIOCCBRK, 0);
+    g_break_release_ms = 0;
+}
 
 /*
  * The host serial is multiplexed by is_console_manager: it reads /dev/ttyS1 and
@@ -863,6 +935,11 @@ static int sol_activate(session_t *s)
     s->sol_ack_seq = 0;
     s->sol_rx_seq = 0;
     s->sol_outlen = 0;
+    s->sol_ninflight = 0;
+    s->sol_retry_ms = 0;
+    s->sol_acks_seen = 0;
+    s->sol_noack = 0;
+    memset(s->sol_inflight, 0, sizeof(s->sol_inflight));
     g_sol_owner  = s;
     logmsg("sol: activated for rm=%08x", s->rm_id);
     return 0;
@@ -876,6 +953,15 @@ static void sol_deactivate(session_t *s)
         logmsg("sol: deactivated for rm=%08x", s->rm_id);
     }
     s->sol_outlen = 0;
+    s->sol_ninflight = 0;
+    s->sol_retry_ms = 0;
+    s->sol_acks_seen = 0;
+    s->sol_noack = 0;
+    if (g_break_release_ms) {
+        if (g_break_fd >= 0)
+            ioctl(g_break_fd, TIOCCBRK, 0);
+        g_break_release_ms = 0;
+    }
     if (g_sol_owner == s)
         g_sol_owner = NULL;
 }
@@ -938,6 +1024,26 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             break;
         }
 
+        case 0x42: {                                /* Get Channel Info */
+            uint8_t ch = (reqlen - 7) > 0 ? (uint8_t)(req[6] & 0x0f) : 0;
+
+            /* 0x0e is "the channel this request arrived on"; the LAN channel is
+             * 1, and everything else is reported as unimplemented. */
+            if (ch == 0x0e || ch == 0x0f)
+                ch = 1;
+            if (ch != 1) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rsp[n++] = 0x01;      /* channel number, low nibble */
+            rsp[n++] = 0x04;      /* medium type: 802.3 LAN, low 7 bits */
+            rsp[n++] = 0x00;      /* protocol type: reserved */
+            rsp[n++] = 0x80;      /* multi-session support, 0 active */
+            rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;  /* vendor ID */
+            rsp[n++] = 0x00; rsp[n++] = 0x00;   /* auxiliary channel info */
+            break;
+        }
+
         case 0x3B:                                  /* Set Session Priv Level */
             if ((reqlen - 7) < 1 || req[6] > 4) {
                 rsp[6] = CC_INVALID_DATA;
@@ -946,6 +1052,13 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             if (s)
                 s->priv = req[6];
             rsp[n++] = 4;
+            break;
+
+        case 0x3C:                                  /* Close Session */
+            /* Acknowledge before tearing the session down: the reply has to go
+             * out on the very session being closed. */
+            if (s)
+                s->close_pending = 1;
             break;
 
         case 0x3D:                                  /* Get Session Info */
@@ -1142,6 +1255,32 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             rsp[n++] = (uint8_t)raw;
             rsp[n++] = 0xc0;                        /* scanning + events on */
             rsp[n++] = (uint8_t)st;
+            break;
+        }
+
+        case 0x23: {                                /* Get Sensor Reading Factors */
+            int i;
+
+            if ((reqlen - 7) < 1) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            for (i = 0; i < g_nsensors; i++)
+                if (g_sensors[i].num == req[6])
+                    break;
+            if (i == g_nsensors) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            /* every sensor here is linear with a fixed M, so the factors are
+             * the same as the ones published in the SDR */
+            rsp[n++] = 0x00;                        /* next reading */
+            rsp[n++] = (uint8_t)(g_sensors[i].mult & 0xff);         /* M LSB */
+            rsp[n++] = (uint8_t)(((g_sensors[i].mult >> 8) & 0x03) << 6);
+            rsp[n++] = 0x00; rsp[n++] = 0x00;       /* B */
+            rsp[n++] = 0x00;                        /* R + B exponent */
+            rsp[n++] = 0x00; rsp[n++] = 0x00;       /* accuracy */
+            rsp[n++] = 0x00;                        /* R exponent */
             break;
         }
 
@@ -1470,10 +1609,13 @@ static void handle_open_request(int fd, const struct sockaddr_in *to,
     auth_algo = pl[12];
 
     if (auth_algo != 1) {
-        /* Only SHA-1 is offered.  Answering with an error makes clients that
-         * proposed SHA-256 (pyghmi does) fall back and retry with SHA-1. */
-        status = RMCP_INSUFF_PRIV;
-        logmsg("open request rejected: auth algo %u, suggesting SHA-1", auth_algo);
+        /* Only cipher suite 3 (RAKP-HMAC-SHA1 + HMAC-SHA1-96 + AES-CBC-128) is
+         * offered.  Report it as an unsupported algorithm rather than with the
+         * catch-all code, so a client that asked for SHA-256 (pyipmi does by
+         * default) says so instead of failing on some unrelated step. */
+        status = RMCP_INVALID_AUTH_ALGO;
+        logmsg("open request rejected: auth algo %u, only SHA-1 (cipher "
+               "suite 3) is supported", auth_algo);
     }
 
     rsp[n++] = pl[0];
@@ -1667,8 +1809,11 @@ static void send_session_payload(int fd, const struct sockaddr_in *to,
     if (pad)
         pad = 16 - pad;
     memcpy(enc, payload, (size_t)plen);
+    /* The IPMI 2.0 confidentiality pad bytes are "don't care", but python-ipmi
+     * validates them against the spec's example pattern 0x01, 0x02, ... so
+     * use that: pyghmi and ipmitool ignore the values and accept it. */
     for (i = 0; i < pad; i++)
-        enc[plen + i] = 0xff;
+        enc[plen + i] = (uint8_t)(i + 1);
     enc[plen + pad] = (uint8_t)pad;
     enclen = plen + pad + 1;
 
@@ -1720,68 +1865,150 @@ static void sol_pump(void)
     }
 }
 
-/* send whatever accumulated, as one SOL data packet */
+/* send whatever accumulated, respecting the acknowledgement window */
 static void sol_flush(void)
 {
     session_t *s = g_sol_owner;
     uint8_t pl[4 + SOL_MAX_OUT + 8];
     int len;
 
-    if (s == NULL || s->sol_cfd < 0 || s->sol_outlen <= 0)
-        return;
-    if (!s->have_peer)
+    if (s == NULL || s->sol_cfd < 0 || s->sol_outlen <= 0 || !s->have_peer)
         return;
 
-    len = s->sol_outlen;
-    if (len > SOL_MAX_OUT)
-        len = SOL_MAX_OUT;
+    while (s->sol_outlen > 0 &&
+           (s->sol_noack || s->sol_ninflight < SOL_WINDOW)) {
+        sol_pkt_t *q;
 
-    pl[0] = s->sol_tx_seq;
-    if (++s->sol_tx_seq == 0)
-        s->sol_tx_seq = 1;                          /* 0 is reserved for ACKs */
-    pl[1] = s->sol_ack_seq;
-    pl[2] = (uint8_t)len;
-    pl[3] = 0;
-    if (!host_power_is_on())
-        pl[3] |= 0x20;                              /* system power is off */
-    memcpy(pl + 4, s->sol_outbuf, (size_t)len);
+        len = s->sol_outlen;
+        if (len > SOL_MAX_OUT)
+            len = SOL_MAX_OUT;
 
-    send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, pl, 4 + len);
-    if (debug_on())
-        logmsg("sol: tx %d chars seq=%u ack=%u", len, pl[0], pl[1]);
+        pl[0] = s->sol_tx_seq;
+        if (++s->sol_tx_seq == 0)
+            s->sol_tx_seq = 1;                  /* 0 is reserved for ACKs */
+        pl[1] = s->sol_ack_seq;
+        pl[2] = (uint8_t)len;
+        pl[3] = 0;
+        if (!host_power_is_on())
+            pl[3] |= 0x20;                      /* system power is off */
+        memcpy(pl + 4, s->sol_outbuf, (size_t)len);
 
-    if (len < s->sol_outlen) {
-        memmove(s->sol_outbuf, s->sol_outbuf + len,
-                (size_t)(s->sol_outlen - len));
-        s->sol_outlen -= len;
-    } else {
-        s->sol_outlen = 0;
+        send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, pl, 4 + len);
+        if (debug_on())
+            logmsg("sol: tx %d chars seq=%u ack=%u inflight=%d",
+                   len, pl[0], pl[1], s->sol_ninflight);
+
+        if (!s->sol_noack) {
+            q = &s->sol_inflight[s->sol_ninflight++];
+            memcpy(q->data, pl, (size_t)(4 + len));
+            q->len   = 4 + len;
+            q->seq   = pl[0];
+            q->tries = 0;
+            if (s->sol_ninflight == 1)
+                s->sol_retry_ms = now_ms() + SOL_RETRY_MS;
+        }
+
+        if (len < s->sol_outlen) {
+            memmove(s->sol_outbuf, s->sol_outbuf + len,
+                    (size_t)(s->sol_outlen - len));
+            s->sol_outlen -= len;
+        } else {
+            s->sol_outlen = 0;
+        }
     }
+}
+
+/* drop `count` entries from the front of the unacknowledged queue */
+static void sol_queue_drop(session_t *s, int count)
+{
+    int i;
+
+    if (count <= 0)
+        return;
+    if (count > s->sol_ninflight)
+        count = s->sol_ninflight;
+    for (i = count; i < s->sol_ninflight; i++)
+        s->sol_inflight[i - count] = s->sol_inflight[i];
+    s->sol_ninflight -= count;
+    memset(&s->sol_inflight[s->sol_ninflight], 0, sizeof(sol_pkt_t));
+    s->sol_retry_ms = s->sol_ninflight ? now_ms() + SOL_RETRY_MS : 0;
+}
+
+/* the client acknowledged up to `seq` (inclusive) */
+static void sol_ack(session_t *s, int seq)
+{
+    int i;
+
+    for (i = 0; i < s->sol_ninflight; i++) {
+        if (s->sol_inflight[i].seq == (uint8_t)seq) {
+            s->sol_acks_seen++;
+            sol_queue_drop(s, i + 1);
+            break;
+        }
+    }
+}
+
+/* retransmit the oldest unacknowledged packet, giving up after a few tries */
+static void sol_retransmit(void)
+{
+    session_t *s = g_sol_owner;
+    sol_pkt_t *q;
+
+    if (s == NULL || s->sol_ninflight <= 0 || s->sol_retry_ms == 0)
+        return;
+    if (now_ms() < s->sol_retry_ms)
+        return;
+    q = &s->sol_inflight[0];
+    if (q->tries >= (s->sol_acks_seen == 0 ? 2 : SOL_MAX_TRIES)) {
+        if (s->sol_acks_seen == 0) {
+            /* the client never acknowledges at all, so a window would stall
+             * the console forever: fall back to plain streaming */
+            logmsg("sol: no acknowledgements from client, streaming without "
+                   "a window");
+            s->sol_noack = 1;
+            sol_queue_drop(s, s->sol_ninflight);
+            s->sol_retry_ms = 0;
+            sol_flush();
+            return;
+        }
+        logmsg("sol: giving up on seq %u after %d tries", q->seq, q->tries);
+        sol_queue_drop(s, 1);
+        sol_flush();                    /* the freed slot may hold up output */
+        return;
+    }
+    q->tries++;
+    if (s->have_peer)
+        send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, q->data, q->len);
+    s->sol_retry_ms = now_ms() + SOL_RETRY_MS;
+    if (debug_on())
+        logmsg("sol: retransmit seq=%u try=%d", q->seq, q->tries);
 }
 
 /* a SOL packet from the client: characters in, acknowledgement out */
 static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen)
 {
     uint8_t ack[4];
-    int seq, n;
+    int seq, acked, n;
 
     if (plen < 4)
         return;
-    seq = pl[0] & 0x0f;
+    seq   = pl[0] & 0x0f;
+    acked = pl[1] & 0x0f;
     if (debug_on())
-        logmsg("sol: rx seq=%d len=%d flags=%02x", seq, plen, pl[3]);
+        logmsg("sol: rx seq=%d ack=%d len=%d flags=%02x", seq, acked, plen, pl[3]);
 
     if (seq != 0 && seq != s->sol_rx_seq && plen > 4 && s->sol_cfd >= 0) {
         s->sol_rx_seq = (uint8_t)seq;
         n = (int)write(s->sol_cfd, pl + 4, (size_t)(plen - 4));
         if (n < 0)
             logmsg("sol: console write: %s", strerror(errno));
+        s->sol_ack_seq = (uint8_t)seq;
     }
     if (pl[3] & 0x10)
-        logmsg("sol: BREAK requested (not forwarded, unix socket cannot carry it)");
+        sol_break_assert();
 
-    if (plen > 4)
-        s->sol_ack_seq = (uint8_t)seq;
+    if (acked != 0)
+        sol_ack(s, acked);
 
     ack[0] = 0;                                     /* no data, pure ACK */
     ack[1] = (uint8_t)seq;
@@ -1789,6 +2016,8 @@ static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen)
     ack[3] = 0;
     if (s->have_peer)
         send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, ack, 4);
+
+    sol_flush();                                    /* window may have opened */
 }
 
 static void handle_encapsulated(int fd, const struct sockaddr_in *to,
@@ -1853,6 +2082,8 @@ static void handle_encapsulated(int fd, const struct sockaddr_in *to,
     }
     send_session_payload(fd, to, s, PT_IPMI, rspmsg, rlen);
     s->last = time(NULL);
+    if (s->close_pending)
+        drop_session(s);
 }
 
 static void handle_rmcp_plus(int fd, const struct sockaddr_in *to,
@@ -1875,6 +2106,44 @@ static void handle_rmcp_plus(int fd, const struct sockaddr_in *to,
         logmsg("unhandled payload type 0x%02x", ptype);
         break;
     }
+}
+
+/* ASF Presence Ping/Pong, RMCP class 6.  Real BMCs answer this and some IPMI
+ * clients insist on it before they will even start an RMCP+ session. */
+static void handle_asf(int fd, const struct sockaddr_in *to,
+                       const uint8_t *pkt, int len)
+{
+    uint8_t out[28];
+    static const uint8_t pong[16] = {
+        0x00, 0x00, 0x11, 0xbe,     /* ASF IANA enterprise number */
+        0x00, 0x00, 0x00, 0x00,     /* OEM defined, must be zero */
+        0x80,                       /* supported entities: IPMI */
+        0x00,                       /* supported interactions */
+        0, 0, 0, 0, 0, 0            /* reserved */
+    };
+
+    if (len < 12)
+        return;
+    if (pkt[4] != 0x00 || pkt[5] != 0x00 || pkt[6] != 0x11 || pkt[7] != 0xbe)
+        return;                             /* not the ASF IANA */
+    if (pkt[8] != 0x80)
+        return;                             /* not a presence ping */
+
+    out[0] = 0x06;                          /* RMCP version 1.0 */
+    out[1] = 0x00;
+    out[2] = 0xff;                          /* no RMCP acknowledgement */
+    out[3] = 0x06;                          /* class: ASF */
+    out[4] = 0x00; out[5] = 0x00; out[6] = 0x11; out[7] = 0xbe;
+    out[8] = 0x40;                          /* presence pong */
+    out[9] = pkt[9];                        /* echo the request tag */
+    out[10] = 0x00;
+    out[11] = (uint8_t)sizeof(pong);
+    memcpy(out + 12, pong, sizeof(pong));
+    if (sendto(fd, out, sizeof(out), 0,
+               (const struct sockaddr *)to, sizeof(*to)) < 0)
+        logmsg("asf: pong sendto: %s", strerror(errno));
+    else if (debug_on())
+        logmsg("asf: presence pong sent");
 }
 
 /* ------------------------------------------------------------------ main */
@@ -2061,6 +2330,8 @@ int main(int argc, char **argv)
         } else if (g_sol_owner != NULL && r == 0) {
             sol_flush();
         }
+        sol_retransmit();
+        sol_break_service();
         if (r <= 0)
             continue;
 
@@ -2082,7 +2353,13 @@ int main(int argc, char **argv)
             }
             if (n <= 3)
                 continue;
-            if (buf[0] != 0x06 || buf[3] != 0x07)
+            if (buf[0] != 0x06)
+                continue;                        /* not RMCP */
+            if (buf[3] == 0x06) {
+                handle_asf(fds[i], &from, buf, n);
+                continue;
+            }
+            if (buf[3] != 0x07)
                 continue;                        /* not an IPMI class packet */
             if (buf[4] == 0x06)
                 handle_rmcp_plus(fds[i], &from, buf, n);

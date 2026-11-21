@@ -257,7 +257,7 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 | [firmware-upgrade.md](firmware-upgrade.md) | A/B 升级机制、两个裸偏移标志、`is_upgrade.sh -C` 的调用链与 `-c` 陷阱 |
 | [web-stack.md](web-stack.md) | 四套路由（sweb / rpc / restapi / redfish）与 RPC 提权洞 |
 | [webtty-diagnosis.md](webtty-diagnosis.md) | **Web Console 打不开的真正原因**：防火墙少了 7681/80 的例外 |
-| [ipmi-parity.md](ipmi-parity.md) | **IPMI 级能力盘点**：控制台、电源、虚拟光驱、SEL、健康，以及缺的 IPMI over LAN |
+| [ipmi-parity.md](ipmi-parity.md) | **IPMI 级能力盘点**：控制台、电源、虚拟光驱、SEL、健康；IPMI over LAN 为自建服务端 |
 | [diff-vs-factory.md](diff-vs-factory.md) | 自编译镜像与出厂 1.2.0.8 的逐项差异 |
 | [dead-libs-audit.md](dead-libs-audit.md) | 「死文件」核查：34 个真孤儿 + 4 个 dlopen 插件 |
 | [gaps.md](gaps.md) | 剩余缺口的分类与判定依据 |
