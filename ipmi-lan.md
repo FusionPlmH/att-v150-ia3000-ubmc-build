@@ -91,7 +91,7 @@ bit5-0 = 长度（≤63）
 | 0 | Set in Progress | 固定 0 |
 | 1 / 2 | Auth Type Support / Enable | 固定 `0x15`（none/一般口令）|
 | 3 | IP Address | 请求的**目的地址**（`IP_PKTINFO`）|
-| 4 | IP Address Source | `/var/run/udhcpc.<if>.pid` 存在则为 DHCP，否则 static |
+| 4 | IP Address Source | `/config/is_mgmtd.conf` 的 `interface-list/<if>/ipv4-origin` |
 | 5 | MAC Address | `/sys/class/net/<if>/address` |
 | 6 | Subnet Mask | `getifaddrs()` 匹配该地址的接口 |
 | 7 | IPv4 Header Params | TTL 64、DF |
@@ -109,6 +109,23 @@ bit5-0 = 长度（≤63）
 
 `lan print` 报告的是**请求进来的那个接口**，不是写死 eth1 —— 所以从 192.168.0.x 侧连进来会
 看到 eth0 的地址。这是用 `recvmsg()` + `IP_PKTINFO` 拿目的地址实现的。
+
+`IP Address Source` 一度报错成 `static`：原来查的是 busybox `udhcpc` 的
+`/var/run/udhcpc.<if>.pid`，但这台机器的 DHCP 是 `is_mgmtd` 自带的客户端在做，那个 pid 文件
+永远不存在。实际来源在厂商配置树里：
+
+```
+/config/is_mgmtd.conf
+  /config/system/mgmt/interface-list/eth0/ipv4-origin,static
+  /config/system/mgmt/interface-list/eth1/ipv4-origin,dhcp     ← 管理口
+  /config/system/mgmt/interface-list/eth0.4088/ipv4-origin,static
+```
+
+现在直接读这棵树（`conf_lookup()`，格式是每行 `<path>,<value>`），`lan print` 正确显示
+`dhcp`。没有 mgmtd 配置时才回落到 udhcpc 的 pid 文件。
+
+> `Default Gateway IP` 显示 `0.0.0.0` **不是** bug —— 同一棵树里就是
+> `default-gateway,0.0.0.0`，这台机器确实没配默认路由。
 
 ## 第二、第三个 cipher suite：17/18/19（SHA-256）
 

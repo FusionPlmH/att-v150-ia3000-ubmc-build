@@ -70,6 +70,9 @@
 #define MAX_USERS        16
 #define PASSWD_FILE      "/config/ipmi-lan.passwd"
 #define LOG_FILE         "/var/log/ipmi-lan.log"
+/* the vendor management daemon keeps its network configuration here, one
+ * "<path>,<value>" per line; interface-list/<if>/ipv4-origin is authoritative */
+#define MGMTD_CONF       "/config/is_mgmtd.conf"
 
 /* SOL */
 #define CONSOLE_SOCK    "/var/run/console_manager_socket"
@@ -1213,15 +1216,59 @@ static struct in_addr iface_gateway(const char *name)
     return gw;
 }
 
-static int iface_is_dhcp(const char *name)
+/* Read one value out of the vendor's flat config tree: every line is
+ * "<path>,<value>".  Returns 0 and fills `out` when the key is present. */
+static int conf_lookup(const char *file, const char *key, char *out,
+                       size_t outlen)
 {
-    char path[64];
+    char line[512];
+    size_t klen = strlen(key);
+    FILE *f;
+
+    f = fopen(file, "r");
+    if (f == NULL)
+        return -1;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *v;
+        size_t n;
+
+        if (strncmp(line, key, klen) != 0 || line[klen] != ',')
+            continue;
+        v = line + klen + 1;
+        n = strlen(v);
+        while (n > 0 && (v[n - 1] == '\n' || v[n - 1] == '\r' ||
+                         v[n - 1] == ' ' || v[n - 1] == '\t'))
+            v[--n] = '\0';
+        snprintf(out, outlen, "%s", v);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
+/* IPMI "IP Address Source": 0 unspecified, 1 static, 2 DHCP */
+static int iface_ipv4_origin(const char *name)
+{
+    char key[192], val[32];
     struct stat st;
 
     if (*name == '\0')
         return 0;
-    snprintf(path, sizeof(path), "/var/run/udhcpc.%s.pid", name);
-    return stat(path, &st) == 0;
+
+    snprintf(key, sizeof(key),
+             "/config/system/mgmt/interface-list/%s/ipv4-origin", name);
+    if (conf_lookup(MGMTD_CONF, key, val, sizeof(val)) == 0) {
+        if (strcmp(val, "dhcp") == 0)
+            return 2;
+        if (strcmp(val, "static") == 0)
+            return 1;
+        return 0;                       /* "none" and anything unknown */
+    }
+
+    /* no mgmtd config: fall back to the busybox DHCP client marker */
+    snprintf(key, sizeof(key), "/var/run/udhcpc.%s.pid", name);
+    return stat(key, &st) == 0 ? 2 : 1;
 }
 
 /* LAN configuration parameter numbers, as they go on the wire (ipmitool's
@@ -1284,7 +1331,7 @@ static int lan_param(uint8_t *out, int max, uint8_t sel)
         len += 4;
         break;
     case LANP_IP_ADDRESS_SOURCE:
-        out[len++] = iface_is_dhcp(ifname) ? 2 : 1;   /* DHCP / static */
+        out[len++] = (uint8_t)iface_ipv4_origin(ifname);
         break;
     case LANP_MAC_ADDRESS:
         memcpy(out + len, mac, 6);
