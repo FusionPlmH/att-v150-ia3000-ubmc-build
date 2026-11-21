@@ -139,8 +139,15 @@ usr/share/lua/5.1/cjson, json2lua.lua, lua2json.lua
 usr/bin/json2lua, lua2json
 ```
 
-公开源码里根本没有这部分。**这既是功能缺失，也是安全优势** ——
-我们当初就是走 REST 的 `/rpc/sys` 拿到 root 的；自编译版没有这个面。
+公开源码里根本没有这部分。它只影响**程序化 API 访问** ——
+Web UI（`/cgi-bin/sweb/admin/...`）、IPMI（SSIF）、SNMP、CLI 全都不经过它。
+
+> ⚠️ **更正**：早期版本的本节曾写作「REST API 是我们拿 root 的入口，
+> 缺了反而是安全优势」—— **这是错的**。
+> 拿 root 走的是 `/rpc/sys`，属于独立的 **RPC 模块**
+> （`base/src/silc_web/modules/rpc/`），与 REST API 无关。
+> 该模块在自编译版里**同样存在**，详见
+> [web-stack.md](web-stack.md#rpc-模块与-restapiredfish-的区别)。
 
 ### ② valgrind 全家桶（~20 个）
 
@@ -222,11 +229,12 @@ usr/lib{,32}/sa                           sysstat 装在 /usr/lib 而非 /usr/li
 
 | 影响 | 项 |
 |---|---|
-| 🔴 **功能缺失** | REST API / Redfish 整块（21 项）—— 但也是安全优势 |
+| 🔴 **功能缺失** | REST API / Redfish 整块（21 项）—— 仅影响程序化 API，不影响任何交互式功能 |
 | 🟡 **版本落后** | OpenSSL 无 1.1.1、glib −1 小版本、net-snmp 单版本、libcurl/libssh 旧 |
 | 🟡 **源码落后** | 1.1.0.5-BETA vs 1.2.0.8，出厂版是内部分支，**无法从公开源追平** |
 | 🟢 平台适配 | `S35is_ipmi` 缺 SKY-D-CC 分支（本机用不到） |
 | ✅ 已修正 | sshd 家目录已改回 `/var/empty`，`/etc/passwd` 除 root 行外与出厂一致 |
+| ⚠️ 共有风险 | `/rpc/sys` 任意命令执行洞 —— **原版和自编译版都有**，源自共享的 RPC 模块 |
 
 ### 判断
 
