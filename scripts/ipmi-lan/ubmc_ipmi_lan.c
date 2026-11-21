@@ -335,6 +335,469 @@ static int host_power_is_on(void)
 
 /* --------------------------------------------------------- IPMI dispatch */
 
+/* ------------------------------------------- SEL / SDR / FRU / boot flags */
+
+#define SEL_FILE        "/var/log/sel"
+#define SEL_SLOT        20              /* vendor slot size in /var/log/sel */
+#define SEL_MAX         200
+#define FRU_EEPROM      "/sys/bus/i2c/devices/0-0050/eeprom"
+#define BOOT_FLAGS_FILE "/config/ipmi-boot-flags"
+#define MAX_SENSORS     48
+#define SDR_BLOB_MAX    (MAX_SENSORS * 80)
+
+#define NETFN_SENSOR    0x04
+#define NETFN_STORAGE   0x0A
+
+/* hwmon-backed sensor, rebuilt at startup so `ipmitool sensor` has an SDR */
+typedef struct {
+    uint8_t num;
+    uint8_t sensor_type;        /* 0x01 temperature, 0x02 voltage, 0x04 fan */
+    uint8_t unit1;
+    int     divisor;            /* raw = milli / divisor */
+    int     mult;               /* M, so the reported value is raw * M */
+    uint8_t thr_mask;           /* bit3 UNC, bit4 UC, bit5 UNR readable */
+    int     unc, uc;
+    char    name[22];
+    char    path[96];
+} sensor_t;
+
+static sensor_t g_sensors[MAX_SENSORS];
+static int      g_nsensors;
+static int      g_sdr_off[MAX_SENSORS];
+static int      g_sdr_len[MAX_SENSORS];
+static uint8_t  g_sdr_blob[SDR_BLOB_MAX];
+static int      g_sdr_total;
+
+static uint8_t  g_fru[256];
+static int      g_frulen;
+static int      g_fru_board_off, g_fru_product_off;
+static uint8_t  g_boot_flags, g_boot_dev;
+static uint8_t  g_selwork[SEL_MAX * 16];
+
+static int read_milli(const char *path, long *out)
+{
+    FILE *f = fopen(path, "r");
+    int rc;
+
+    if (!f)
+        return -1;
+    rc = fscanf(f, "%ld", out);
+    fclose(f);
+    return rc == 1 ? 0 : -1;
+}
+
+/* read a one-line text file and strip the trailing newline */
+static int read_str(const char *path, char *out, int outlen)
+{
+    FILE *f = fopen(path, "r");
+    int n;
+
+    if (!f)
+        return -1;
+    if (fgets(out, outlen, f) == NULL) {
+        fclose(f);
+        out[0] = '\0';
+        return -1;
+    }
+    fclose(f);
+    n = (int)strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = '\0';
+    return 0;
+}
+
+static void sensor_add(const char *name, int idx, uint8_t stype, uint8_t unit1,
+                       int divisor, int mult, const char *dir, const char *fmt,
+                       const char *maxfmt, const char *critfmt)
+{
+    sensor_t *s;
+    char path[96], aux[96];
+    long v;
+
+    if (g_nsensors >= MAX_SENSORS)
+        return;
+    snprintf(path, sizeof(path), fmt, dir, idx);
+    if (read_milli(path, &v) != 0)
+        return;                             /* channel absent or empty */
+
+    s = &g_sensors[g_nsensors];
+    memset(s, 0, sizeof(*s));
+    s->num         = (uint8_t)(g_nsensors + 1);
+    s->sensor_type = stype;
+    s->unit1       = unit1;
+    s->divisor     = divisor;
+    s->mult        = mult;
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    snprintf(s->path, sizeof(s->path), "%s", path);
+
+    if (maxfmt) {
+        snprintf(aux, sizeof(aux), maxfmt, dir, idx);
+        if (read_milli(aux, &v) == 0 && v > 0) {
+            s->unc = (int)(v / divisor);
+            s->thr_mask |= 0x08;
+        }
+    }
+    if (critfmt) {
+        snprintf(aux, sizeof(aux), critfmt, dir, idx);
+        if (read_milli(aux, &v) == 0 && v > 0) {
+            s->uc = (int)(v / divisor);
+            s->thr_mask |= 0x10;
+        }
+    }
+    g_nsensors++;
+}
+
+/* hwmonN is assigned by probe order, so look the device up by name */
+static char *hwmon_dir(const char *want, char *buf, int buflen)
+{
+    char p[64], nm[64];
+    int i;
+
+    for (i = 0; i <= 7; i++) {
+        snprintf(p, sizeof(p), "/sys/class/hwmon/hwmon%d/name", i);
+        if (read_str(p, nm, sizeof(nm)) != 0)
+            continue;
+        if (strcmp(nm, want) == 0) {
+            snprintf(buf, buflen, "/sys/class/hwmon/hwmon%d", i);
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+static void sensors_scan(void)
+{
+    char d[64], nm[22];
+    int i;
+
+    g_nsensors = 0;
+
+    if (hwmon_dir("peci_cputemp.cpu0", d, sizeof(d)) != NULL) {
+        for (i = 1; i <= 13; i++) {
+            snprintf(nm, sizeof(nm), "CPU Temp %d", i);
+            sensor_add(nm, i, 0x01, 0x01, 1000, 1, d,
+                       "%s/temp%d_input", "%s/temp%d_max", "%s/temp%d_crit");
+        }
+    }
+    if (hwmon_dir("silc_fan", d, sizeof(d)) != NULL) {
+        for (i = 1; i <= 4; i++) {
+            snprintf(nm, sizeof(nm), "Fan %d", i);
+            sensor_add(nm, i, 0x04, 0x12, 100, 100, d,
+                       "%s/fan%d_input", NULL, NULL);
+        }
+        for (i = 1; i <= 3; i++) {
+            snprintf(nm, sizeof(nm), "Board Temp %d", i);
+            sensor_add(nm, i, 0x01, 0x01, 1000, 1, d,
+                       "%s/temp%d_input", NULL, NULL);
+        }
+    }
+    if (hwmon_dir("ads7830", d, sizeof(d)) != NULL) {
+        for (i = 0; i <= 7; i++) {
+            snprintf(nm, sizeof(nm), "Volt %d", i);
+            sensor_add(nm, i, 0x02, 0x04, 1000, 1, d,
+                       "%s/in%d_input", NULL, NULL);
+        }
+    }
+    logmsg("sdr: %d sensors", g_nsensors);
+}
+
+/* Full Sensor Record (type 01h), 50 bytes fixed + ID string */
+static int sdr_build_record(uint8_t *p, int id, const sensor_t *s)
+{
+    int nl = (int)strlen(s->name);
+
+    memset(p, 0, 80);
+    p[0]  = (uint8_t)(id & 0xff);
+    p[1]  = (uint8_t)(id >> 8);
+    p[2]  = 0x51;                       /* SDR version */
+    p[3]  = 0x01;                       /* full sensor record */
+    p[4]  = (uint8_t)(43 + nl);         /* bytes after this field */
+    p[5]  = 0x20;                       /* owned by the BMC */
+    p[6]  = 0x00;
+    p[7]  = s->num;
+    p[8]  = 0x07;                       /* entity: system board */
+    p[9]  = 0x01;
+    p[10] = 0x00;                       /* no initialisation required */
+    p[11] = 0x40;                       /* sensor readable */
+    p[12] = s->sensor_type;
+    p[13] = 0x01;                       /* threshold based */
+    p[14] = s->thr_mask;                /* assertion / lower threshold mask */
+    p[16] = s->thr_mask;                /* deassertion / upper threshold mask */
+    p[20] = s->unit1;
+    p[23] = 0x00;                       /* linear */
+    p[24] = (uint8_t)(s->mult & 0xff);  /* M */
+    p[25] = (uint8_t)(((s->mult >> 8) & 0x03) << 6);
+    p[35] = 0xff;                       /* maximum reading */
+    if (s->thr_mask & 0x10)
+        p[38] = (uint8_t)s->uc;
+    if (s->thr_mask & 0x08)
+        p[39] = (uint8_t)s->unc;
+    p[47] = (uint8_t)(0xc0 | nl);       /* ID string, ASCII+Latin1 */
+    memcpy(p + 48, s->name, (size_t)nl);
+    return 48 + nl;
+}
+
+static void sdr_build(void)
+{
+    int i, id = 1;
+
+    g_sdr_total = 0;
+    for (i = 0; i < g_nsensors; i++) {
+        int len = sdr_build_record(g_sdr_blob + g_sdr_total, id, &g_sensors[i]);
+        g_sdr_off[i]  = g_sdr_total;
+        g_sdr_len[i]  = len;
+        g_sdr_total  += len;
+        id++;
+    }
+}
+
+/* vendor slots are 20 bytes; IPMI wants standard 16-byte records */
+static int sel_load(uint8_t *out, int maxrec)
+{
+    FILE *f = fopen(SEL_FILE, "rb");
+    uint8_t slot[SEL_SLOT];
+    int n = 0;
+
+    if (!f)
+        return 0;
+    while (n < maxrec && fread(slot, 1, SEL_SLOT, f) == SEL_SLOT) {
+        if (slot[2] != 0x02)            /* not a system event record */
+            continue;
+        out[n * 16 + 0]  = slot[1];     /* record id (low byte) */
+        out[n * 16 + 1]  = 0x00;
+        out[n * 16 + 2]  = slot[2];     /* record type */
+        out[n * 16 + 3]  = slot[7];     /* timestamp: big endian -> little */
+        out[n * 16 + 4]  = slot[6];
+        out[n * 16 + 5]  = slot[5];
+        out[n * 16 + 6]  = slot[4];
+        out[n * 16 + 7]  = slot[8];     /* generator id */
+        out[n * 16 + 8]  = slot[9];
+        out[n * 16 + 9]  = slot[10];    /* event message format version */
+        out[n * 16 + 10] = slot[11];    /* sensor type */
+        out[n * 16 + 11] = slot[12];    /* sensor number */
+        out[n * 16 + 12] = slot[13];    /* event dir / event type */
+        out[n * 16 + 13] = slot[14];    /* event data 1..3 */
+        out[n * 16 + 14] = slot[15];
+        out[n * 16 + 15] = slot[16];
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static uint32_t sel_last_timestamp(void)
+{
+    static uint8_t recs[SEL_MAX * 16];
+    uint32_t last = 0;
+    int i, n = sel_load(recs, SEL_MAX);
+
+    for (i = 0; i < n; i++) {
+        uint32_t ts = rd_le32(recs + i * 16 + 3);
+        if (ts > last)
+            last = ts;
+    }
+    return last;
+}
+
+static void sel_clear(void)
+{
+    uint8_t zero[512];
+    FILE *f;
+
+    memset(zero, 0, sizeof(zero));
+    f = fopen(SEL_FILE, "wb");
+    if (!f)
+        return;
+    for (int i = 0; i < (SEL_SLOT * SEL_MAX) / (int)sizeof(zero); i++)
+        fwrite(zero, 1, sizeof(zero), f);
+    fclose(f);
+    logmsg("sel: cleared");
+}
+
+/* ---- FRU: convert the ONIE TLV EEPROM into an IPMI FRU image ---- */
+
+static struct {
+    char manufacturer[40];
+    char product[40];
+    char part[40];
+    char serial[40];
+    char version[40];
+    char mfgdate[24];
+} g_fruinfo;
+
+static void tlv_str(const uint8_t *buf, int totlen, uint8_t type,
+                    char *out, int outlen)
+{
+    int i = 11, end = 11 + totlen;
+
+    out[0] = '\0';
+    while (i + 1 < end && i + 1 < 256) {
+        int t = buf[i], l = buf[i + 1];
+        if (t == 0xfe || l < 0)
+            return;
+        if (t == type) {
+            int c = l < outlen - 1 ? l : outlen - 1;
+            memcpy(out, buf + i + 2, (size_t)c);
+            out[c] = '\0';
+            return;
+        }
+        i += 2 + l;
+    }
+}
+
+/* "MM/DD/YYYY hh:mm:ss" -> minutes since 1996-01-01, IPMI board mfg date */
+static int32_t fru_date_minutes(const char *s)
+{
+    int mo = 0, dy = 0, yy = 0, hh = 0, mi = 0, i;
+    int32_t days;
+    static const int mdays[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+
+    if (sscanf(s, "%d/%d/%d %d:%d", &mo, &dy, &yy, &hh, &mi) < 3)
+        return 0;
+    if (mo < 1 || mo > 12 || yy < 1996)
+        return 0;
+    days = (yy - 1996) * 365 + (yy - 1996 + 3) / 4 + mdays[mo - 1] + (dy - 1);
+    if (mo > 2 && ((yy % 4) == 0))
+        days++;
+    (void)i;
+    return days * 1440 + hh * 60 + mi;
+}
+
+typedef struct { uint8_t type; const char *val; } fru_tlv_t;
+
+static int fru_build_area(uint8_t *a, int with_date, int32_t minutes,
+                          const fru_tlv_t *tlvs, int n)
+{
+    int off = with_date ? 6 : 3;
+    int i, total, pad, sum = 0;
+
+    a[0] = 0x01;                        /* area format version */
+    a[2] = 0x19;                        /* English */
+    if (with_date) {
+        a[3] = (uint8_t)(minutes & 0xff);
+        a[4] = (uint8_t)((minutes >> 8) & 0xff);
+        a[5] = (uint8_t)((minutes >> 16) & 0xff);
+    }
+    for (i = 0; i < n; i++) {
+        int l;
+        if (tlvs[i].val == NULL || tlvs[i].val[0] == '\0')
+            continue;
+        l = (int)strlen(tlvs[i].val);
+        if (l > 63)
+            l = 63;
+        /* FRU fields pack the type (bits 7:6) and length (bits 5:0) into one
+         * byte; 0b11 = 8-bit ASCII + Latin1 */
+        a[off++] = (uint8_t)(0xc0 | l);
+        memcpy(a + off, tlvs[i].val, (size_t)l);
+        off += l;
+    }
+    a[off++] = 0xc1;                    /* end of list */
+    total = off + 1;
+    pad = (8 - (total % 8)) % 8;
+    while (pad-- > 0)
+        a[off++] = 0x00;
+    total = off + 1;
+    a[1] = (uint8_t)(total / 8);
+    for (i = 0; i < off; i++)
+        sum += a[i];
+    a[off] = (uint8_t)(0x100 - (sum & 0xff));
+    return total;
+}
+
+static void fru_build(void)
+{
+    uint8_t eeprom[256];
+    fru_tlv_t board[6], prod[7];
+    FILE *f;
+    int got = 0, blen, plen, sum = 0, i;
+
+    g_frulen = 0;
+    memset(&g_fruinfo, 0, sizeof(g_fruinfo));
+
+    f = fopen(FRU_EEPROM, "rb");
+    if (f) {
+        got = (int)fread(eeprom, 1, sizeof(eeprom), f);
+        fclose(f);
+    }
+    if (got > 11 && memcmp(eeprom, "TlvInfo", 7) == 0) {
+        tlv_str(eeprom, eeprom[10], 0x2d, g_fruinfo.manufacturer, sizeof(g_fruinfo.manufacturer));
+        tlv_str(eeprom, eeprom[10], 0x21, g_fruinfo.product,      sizeof(g_fruinfo.product));
+        tlv_str(eeprom, eeprom[10], 0x22, g_fruinfo.part,         sizeof(g_fruinfo.part));
+        tlv_str(eeprom, eeprom[10], 0x23, g_fruinfo.serial,       sizeof(g_fruinfo.serial));
+        tlv_str(eeprom, eeprom[10], 0x27, g_fruinfo.version,      sizeof(g_fruinfo.version));
+        tlv_str(eeprom, eeprom[10], 0x25, g_fruinfo.mfgdate,      sizeof(g_fruinfo.mfgdate));
+    } else {
+        /* no TLV EEPROM: fall back to the product files */
+        g_fruinfo.manufacturer[0] = '\0';
+        read_str("/etc/product/vendor", g_fruinfo.manufacturer, sizeof(g_fruinfo.manufacturer));
+        read_str("/etc/product/UBMC/OEMI/model.txt", g_fruinfo.product, sizeof(g_fruinfo.product));
+        read_str("/etc/product/UBMC/version/software_version.txt", g_fruinfo.version,
+                 sizeof(g_fruinfo.version));
+    }
+
+    board[0].type = 0x02; board[0].val = g_fruinfo.manufacturer;
+    board[1].type = 0x03; board[1].val = g_fruinfo.product;
+    board[2].type = 0x04; board[2].val = g_fruinfo.serial;
+    board[3].type = 0x05; board[3].val = g_fruinfo.part;
+    board[4].type = 0x06; board[4].val = "ubmc-fru";
+    board[5].type = 0x00; board[5].val = NULL;
+
+    prod[0].type = 0x02; prod[0].val = g_fruinfo.manufacturer;
+    prod[1].type = 0x03; prod[1].val = g_fruinfo.product;
+    prod[2].type = 0x04; prod[2].val = g_fruinfo.part;
+    prod[3].type = 0x05; prod[3].val = g_fruinfo.version;
+    prod[4].type = 0x06; prod[4].val = g_fruinfo.serial;
+    prod[5].type = 0x07; prod[5].val = NULL;
+    prod[6].type = 0x08; prod[6].val = "ubmc-fru";
+
+    memset(g_fru, 0, sizeof(g_fru));
+    g_fru[0] = 0x01;                    /* common header version */
+    g_fru[1] = 0x00;                    /* internal use: none */
+    g_fru[2] = 0x00;                    /* chassis info: none */
+    g_fru_board_off   = 8;
+    g_fru_product_off = 8 + fru_build_area(g_fru + 8, 1,
+                                           fru_date_minutes(g_fruinfo.mfgdate),
+                                           board, 5);
+    plen = fru_build_area(g_fru + g_fru_product_off, 0, 0, prod, 7);
+    /* the common header stores area offsets in 8-byte units */
+    g_fru[3] = (uint8_t)(g_fru_board_off / 8);
+    g_fru[4] = (uint8_t)(g_fru_product_off / 8);
+    g_fru[5] = 0x00;                    /* multi-record: none */
+    g_fru[6] = 0x00;                    /* pad */
+    for (i = 0; i < 7; i++)
+        sum += g_fru[i];
+    g_fru[7] = (uint8_t)(0x100 - (sum & 0xff));
+    g_frulen = g_fru_product_off + plen;
+    blen = g_fru_product_off - g_fru_board_off;
+    logmsg("fru: %d bytes (board %d, product %d) %s / %s",
+           g_frulen, blen, plen, g_fruinfo.manufacturer, g_fruinfo.product);
+}
+
+static void boot_flags_load(void)
+{
+    char buf[16];
+    unsigned f = 0, d = 0;
+
+    g_boot_flags = 0;
+    g_boot_dev = 0;
+    if (read_str(BOOT_FLAGS_FILE, buf, sizeof(buf)) != 0)
+        return;
+    if (sscanf(buf, "%x %x", &f, &d) == 2) {
+        g_boot_flags = (uint8_t)f;
+        g_boot_dev   = (uint8_t)d;
+    }
+}
+
+static void boot_flags_save(void)
+{
+    FILE *f = fopen(BOOT_FLAGS_FILE, "w");
+
+    if (!f)
+        return;
+    fprintf(f, "%02x %02x\n", g_boot_flags, g_boot_dev);
+    fclose(f);
+}
+
 static int dispatch_ipmi(const uint8_t *req, int reqlen,
                          uint8_t *rsp, int *rsplen, session_t *s)
 {
@@ -461,6 +924,280 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
         }
 
         case 0x04:                                  /* Chassis Identify */
+            break;
+
+        case 0x08: {                                /* Set System Boot Options */
+            if ((reqlen - 7) < 2) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (req[6] != 5) {
+                /* clients disable the boot-options timer first (parameter 3);
+                 * accept anything else and simply do not store it */
+                break;
+            }
+            g_boot_flags = req[7];
+            g_boot_dev   = req[8];
+            if (g_boot_dev == 0)
+                g_boot_flags = 0;                   /* default = no override */
+            boot_flags_save();
+            logmsg("boot flags set: flags=%02x dev=%02x", g_boot_flags, g_boot_dev);
+            break;
+        }
+
+        case 0x09: {                                /* Get System Boot Options */
+            if ((reqlen - 7) < 1) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (req[6] != 5) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            boot_flags_load();
+            rsp[n++] = 0x01;                        /* parameter revision */
+            rsp[n++] = 0x05;                        /* selector, no channel */
+            if (g_boot_dev == 0) {
+                /* bit 7 set means "no override in effect"; pyghmi's
+                 * get_bootdev() maps that to {'bootdev': 'default'} */
+                rsp[n++] = 0x80;
+                rsp[n++] = 0x00;
+            } else {
+                rsp[n++] = (uint8_t)(g_boot_flags & 0x7f);
+                rsp[n++] = g_boot_dev;
+            }
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00;
+            break;
+        }
+
+        default:
+            rsp[6] = CC_INVALID_CMD;
+            break;
+        }
+        break;
+
+    case NETFN_SENSOR:
+        switch (cmd) {
+        case 0x2D: {                                /* Get Sensor Reading */
+            int i, raw, st = 0;
+            long v;
+
+            if ((reqlen - 7) < 1) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            for (i = 0; i < g_nsensors; i++)
+                if (g_sensors[i].num == req[6])
+                    break;
+            if (i == g_nsensors) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (read_milli(g_sensors[i].path, &v) != 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            raw = (int)(v / g_sensors[i].divisor);
+            if (raw < 0)
+                raw = 0;
+            if (raw > 255)
+                raw = 255;
+            if ((g_sensors[i].thr_mask & 0x10) && raw >= g_sensors[i].uc)
+                st |= 0x10;                         /* upper critical */
+            if ((g_sensors[i].thr_mask & 0x08) && raw >= g_sensors[i].unc)
+                st |= 0x08;                         /* upper non-critical */
+            rsp[n++] = (uint8_t)raw;
+            rsp[n++] = 0xc0;                        /* scanning + events on */
+            rsp[n++] = (uint8_t)st;
+            break;
+        }
+
+        default:
+            rsp[6] = CC_INVALID_CMD;
+            break;
+        }
+        break;
+
+    case NETFN_STORAGE:
+        switch (cmd) {
+        case 0x10: {                                /* Get FRU Area Info */
+            if ((reqlen - 7) < 1 || req[6] != 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rsp[n++] = (uint8_t)(g_frulen & 0xff);
+            rsp[n++] = (uint8_t)(g_frulen >> 8);
+            rsp[n++] = 0x00;                        /* byte-wise access */
+            break;
+        }
+
+        case 0x11: {                                /* Read FRU Data */
+            int off, want, avail;
+
+            if ((reqlen - 7) < 4 || req[6] != 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            off  = req[7] | (req[8] << 8);
+            want = req[9];
+            if (off >= g_frulen) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            avail = g_frulen - off;
+            if (want > avail)
+                want = avail;
+            if (want > 64)
+                want = 64;
+            rsp[n++] = (uint8_t)want;
+            memcpy(rsp + n, g_fru + off, (size_t)want);
+            n += want;
+            break;
+        }
+
+        case 0x20:                                  /* Get SDR Repository Info */
+            rsp[n++] = 0x51;
+            rsp[n++] = (uint8_t)(g_nsensors & 0xff);
+            rsp[n++] = (uint8_t)(g_nsensors >> 8);
+            rsp[n++] = 0xff; rsp[n++] = 0xff;       /* free space: n/a */
+            rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+            rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+            rsp[n++] = 0x02;                        /* reserve supported */
+            break;
+
+        case 0x22:                                  /* Reserve SDR Repository */
+            rsp[n++] = 0x00; rsp[n++] = 0x00;
+            break;
+
+        case 0x23: {                                /* Get SDR */
+            int idx, off, want, avail, chunk;
+            uint16_t rid, next;
+
+            if ((reqlen - 7) < 6) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rid  = (uint16_t)(req[8] | (req[9] << 8));
+            off  = req[10];
+            want = req[11];
+            if (rid == 0x0000 || rid == 0xffff)
+                rid = 0x0001;                       /* first record */
+            idx = (int)rid - 1;
+            if (idx < 0 || idx >= g_nsensors || want == 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            avail = g_sdr_len[idx] - off;
+            if (avail <= 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            chunk = want < avail ? want : avail;
+            next  = (uint16_t)((idx + 1 < g_nsensors) ? idx + 2 : 0xffff);
+            rsp[n++] = (uint8_t)(next & 0xff);
+            rsp[n++] = (uint8_t)(next >> 8);
+            memcpy(rsp + n, g_sdr_blob + g_sdr_off[idx] + off, (size_t)chunk);
+            n += chunk;
+            break;
+        }
+
+        case 0x40: {                                /* Get SEL Info */
+            int cnt = sel_load(g_selwork, SEL_MAX);
+            uint32_t ts = sel_last_timestamp();
+
+            rsp[n++] = 0x51;                        /* SEL revision */
+            rsp[n++] = (uint8_t)(cnt & 0xff);
+            rsp[n++] = (uint8_t)(cnt >> 8);
+            rsp[n++] = 0x00; rsp[n++] = 0x00;       /* free space: full */
+            rsp[n++] = (uint8_t)(ts & 0xff);
+            rsp[n++] = (uint8_t)((ts >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((ts >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((ts >> 24) & 0xff);
+            rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+            rsp[n++] = 0x02;                        /* reserve supported */
+            break;
+        }
+
+        case 0x42:                                  /* Reserve SEL */
+            rsp[n++] = 0x01; rsp[n++] = 0x00;
+            break;
+
+        case 0x43: {                                /* Get SEL Entry */
+            int off, want, chunk, cnt, i, idx = -1;
+            uint16_t rid, next;
+
+            if ((reqlen - 7) < 6) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rid  = (uint16_t)(req[8] | (req[9] << 8));
+            off  = req[10];
+            want = req[11];
+            cnt  = sel_load(g_selwork, SEL_MAX);
+            if (cnt == 0) {
+                next = 0xffff;
+                rsp[n++] = (uint8_t)(next & 0xff);
+                rsp[n++] = (uint8_t)(next >> 8);
+                rsp[n++] = 0xff; rsp[n++] = 0xff;   /* no more records */
+                rsp[n++] = 0;
+                rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+                rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+                rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
+                rsp[n++] = 0; rsp[n++] = 0;
+                break;
+            }
+            for (i = 0; i < cnt; i++) {
+                if (rid == 0x0000 || rid == 0xffff) {
+                    idx = 0;
+                    break;
+                }
+                if (g_selwork[i * 16] == (rid & 0xff) &&
+                    g_selwork[i * 16 + 1] == (rid >> 8)) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (off >= 16) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            chunk = 16 - off;
+            if (want < chunk)
+                chunk = want;
+            next = (uint16_t)((idx + 1 < cnt) ? g_selwork[(idx + 1) * 16] : 0xffff);
+            rsp[n++] = (uint8_t)(next & 0xff);
+            rsp[n++] = (uint8_t)(next >> 8);
+            memcpy(rsp + n, g_selwork + idx * 16 + off, (size_t)chunk);
+            n += chunk;
+            break;
+        }
+
+        case 0x47:                                  /* Clear SEL */
+            if ((reqlen - 7) >= 5) {
+                if ((req[8] == 'C') && (req[9] == 'L') && (req[10] == 'R') &&
+                    (req[11] & 0x0f) == 0x0a)
+                    sel_clear();
+            }
+            rsp[n++] = 0x00;                        /* erase complete */
+            break;
+
+        case 0x48: {                                /* Get SEL Time */
+            time_t now = time(NULL);
+            uint32_t t = (uint32_t)now;
+            rsp[n++] = (uint8_t)(t & 0xff);
+            rsp[n++] = (uint8_t)((t >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((t >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((t >> 24) & 0xff);
+            break;
+        }
+
+        case 0x49:                                  /* Set SEL Time */
             break;
 
         default:
@@ -995,6 +1732,11 @@ int main(int argc, char **argv)
     load_users();
     if (g_nusers == 0)
         logmsg("warning: no users loaded, every login will fail");
+
+    sensors_scan();
+    sdr_build();
+    fru_build();
+    boot_flags_load();
 
     bindlist = getenv("IPMI_LAN_BIND");
     if (!bindlist)

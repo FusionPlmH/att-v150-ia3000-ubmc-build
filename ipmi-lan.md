@@ -10,8 +10,82 @@
 |---|---|
 | Get Chassis Status (0x00 0x01) | `ubmc_sys_ctrl.sh -q` |
 | Chassis Control (0x00 0x02) | `-f` / `-o` / `-c` / `-r` / `-s` |
+| Get/Set System Boot Options (0x00 0x08/0x09) | `/config/ipmi-boot-flags` |
 | Get Device ID (0x06 0x01) | 静态 |
-| Get Chassis Caps (0x00 0x00)、Set Session Privilege (0x06 0x3B) 等 | 静态 |
+| Get Sensor Reading (0x04 0x2D) | 实时读 `/sys/class/hwmon/*` |
+| Get SDR Repository Info / Reserve / Get SDR (0x0A 0x20/0x22/0x23) | 启动时按 hwmon 生成 SDR 仓库 |
+| Get SEL Info / Reserve / Get Entry / Clear / Get-Set Time (0x0A 0x40…0x49) | 转换 `/var/log/sel` |
+| Get FRU Area Info / Read FRU Data (0x0A 0x10/0x11) | 转换 I2C EEPROM 的 ONIE TLV |
+| Set Session Privilege (0x06 0x3B) 等 | 静态 |
+
+## 数据源
+
+| 子系统 | 来源 | 说明 |
+|---|---|---|
+| 温度/风扇/电压 | `/sys/class/hwmon/hwmonN` | 按 `name` 查找：`peci_cputemp.cpu0`（CPU 温度 13 通道）、`silc_fan`（4 风扇 + 3 板温）、`ads7830`（8 路 ADC）。实测 24 个通道有值 |
+| SEL | `/var/log/sel` | 持久分区 mmcblk0p7；厂商格式为 **20 字节/条 × 200 槽** 循环缓冲，读到有效记录（`[2]==0x02`）后转成标准 16 字节记录。实测 199 条 |
+| FRU | `/sys/bus/i2c/devices/0-0050/eeprom` | 256 字节 ONIE **TlvInfo** EEPROM（不是 IPMI FRU 格式），启动时转成 IPMI FRU 公共头 + Board + Product 三个区域 |
+| Boot flags | `/config/ipmi-boot-flags` | 两字节 `flags dev`（十六进制文本） |
+
+### 厂商 SEL 槽格式（20 字节）
+
+```
+[0] 00          [1] Record ID   [2] 记录类型（0x02 = system event）
+[3] 0xFB        [4..7] 时间戳（大端秒）      [8][9] Generator ID
+[10] EvM Rev    [11] 传感器类型  [12] 传感器号  [13] 事件方向/类型
+[14..16] Event Data 1/2/3                     [17..19] 填充
+```
+
+### 传感器映射
+
+| hwmon | IPMI 传感器类型 | 单位 | M | 说明 |
+|---|---|---|---|---|
+| `peci_cputemp` temp1..13 | 0x01 Temperature | 0x01 (°C) | 1 | raw = 毫度/1000；`_max`→UNC、`_crit`→UC 作为阈值 |
+| `silc_fan` fan1..4 | 0x04 Fan | 0x12 (RPM) | 100 | raw = 毫值/100，M=100 还原成 RPM |
+| `silc_fan` temp1..3 | 0x01 Temperature | 0x01 (°C) | 1 | 板温 |
+| `ads7830` in0..7 | 0x02 Voltage | 0x04 (V) | 1 | raw = 毫伏/1000 |
+
+## 另外三个「格式」坑
+
+### 6. SDR Full Sensor Record 的 ID 串在偏移 47，不是 49
+
+我最初按"43-46 是正/负滞回，47-48 保留，49 是 ID 串类型/长度"来写，结果
+pyghmi 直接 `UnicodeDecodeError`。用两个独立实现交叉验证（pyghmi 的
+`sdr.py` 和 `python-ipmi` 的 `SdrFullSensorRecord`）都指向 **47**，
+即 LNC(0x2A) 之后紧跟 正滞回(0x2B-0x2C)、负滞回(0x2D-0x2E)、ID 串(0x2F)，
+**没有**那两个保留字节。
+
+```
+total = 48 + len(name)
+record_length = 43 + len(name)
+```
+
+### 7. FRU 区域的偏移字段以 8 字节为单位
+
+公共头里 `Board Info Area Starting Offset` / `Product Info Area Starting Offset`
+存的是 **8 字节单位数**，不是字节偏移。写 8 会被当成 64。
+
+### 8. FRU 字段的「类型+长度」打包在同一个字节
+
+```
+bit7-6 = 类型（0b11 = 8-bit ASCII + Latin1）
+bit5-0 = 长度（≤63）
+```
+后面直接跟数据，**没有**独立的长度字节。字段含义由位置决定
+（Board 区第 1 个字段固定是制造商，第 2 个是产品名……），
+所以所有文本字段都写 `0xC0 | len`。终止符 `0xC1` 其实就是"类型 3、长度 1"。
+
+## 尚未实现
+
+- **SOL**（`ipmitool sol activate`）—— 数据面需要把 RMCP+ payload type 1 桥接到
+  `/dev/ttyF0`。但那个设备当前被 `serial_socket_client`（ttyd/Web Console）独占，
+  两者要共存得先设计一个复用方案；Web 侧已经有完整控制台，所以先不做。
+- **`Get Sensor Reading Factors`**（0x04 0x23）—— 只有非线性传感器才需要，本机都是线性。
+- 传感器阈值只有 CPU 温度有（`_max`/`_crit`），风扇和 ADC 通道没有阈值可读。
+
+未识别的 netfn/cmd 统一返回 `0xC1`（Invalid Command），不会挂住客户端。
+收到 `Get SDR` 的 6 字节请求时若长度不足会返回 `0xCC`，pyghmi 会自行改用 size=5 重试。
+
 
 只实现 cipher suite 3（HMAC-SHA1 认证 + HMAC-SHA1-96 完整性 + AES-CBC-128 加密）——
 这是 `ipmitool -I lanplus` 和 pyghmi 的默认组合。
@@ -23,7 +97,8 @@
 | `ubmc_ipmi_lan.c` | 守护进程（~1000 行，依赖 libcrypto） |
 | `S47is_ipmi_lan` | init 脚本（start/stop/restart/status，带守护重启） |
 | `probe623.py` | 裸 UDP 探活：发一条合法的 IPMI 1.5 Get Channel Auth Capabilities |
-| `ipmi-client-test.py` | pyghmi 验收测试（完整 RMCP+ 握手 + 真实命令） |
+| `ipmi-client-test.py` | pyghmi 验收测试（RMCP+ 握手 + 电源） |
+| `ipmi-extras-test.py` | pyghmi 验收：SDR/传感器 / FRU / SEL / bootdev |
 | `apply-runtime.sh` | **不刷机**前提下在真机上部署/调试，仅在开发时用 |
 
 ## 凭据为什么单独存
@@ -150,14 +225,4 @@ tail -f /var/log/ipmi-lan.log
 `IPMI_LAN_DEBUG=1` 会把每个收到的包和 RMCP+ 头部 hexdump 出来，解密后的 IPMI
 消息也会打印（`req (N): ...`）。
 
-## 尚未实现
 
-Redfish 侧已经能用（见 `web-stack.md`），IPMI 侧目前只覆盖电源与设备信息。缺：
-
-- **SEL**（`ipmitool sel list`）—— 需要把 `/var/log/host_serial.log` 或 syslog 桥接成 SEL 记录
-- **SDR / 传感器读数**（`ipmitool sensor`）—— 需要传感器 SDR 仓库
-- **FRU**（`ipmitool fru`）—— 机箱序列号等信息原厂在 CLI `show device` 里有，可静态编入
-- **SOL**（`ipmitool sol activate`）—— 串口控制台目前走 ttyd/nginx `/ws`
-- **Boot device 设置**（`ipmitool chassis bootdev`）
-
-未识别的 netfn/cmd 统一返回 `0xC1`（Invalid Command），不会挂住客户端。
