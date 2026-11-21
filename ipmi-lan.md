@@ -80,15 +80,69 @@ bit5-0 = 长度（≤63）
 
 ## 尚未实现
 
-- **LAN configuration parameters**（0x0C 0x02）—— 所以 `ipmitool lan print` 能跑通（会自己
-  打印 `not supported`），但读不到 IP/掩码/网关的值。要做需要把收包从 `recvfrom` 换成
-  `recvmsg` + `IP_PKTINFO` 拿到目的地址，再映射到接口。
-- **SHA-256 cipher suite（17/18/19）** —— python-ipmi（`ipmitool.py`）默认挑套件 17，会被
-  拒。用 `-o cipher=3` 指定套件 3 即可正常工作。
-- 传感器阈值只有 CPU 温度有（`_max`/`_crit`），风扇和 ADC 通道没有阈值可读。
-- **主机 → 客户端的 BREAK 通知**：`payload[3] & 0x04`（"收到 BREAK"）不会置位。反向的
-  客户端 → 主机 BREAK（`payload[3] & 0x10`）已实现并实测可用。
-- 未实现 `Set LAN Config`、`Get/Set User Access`、IPMB 桥接、PEF、SDR 设备端写入。
+- **Set LAN Configuration Parameters**（0x0C 0x01）—— 只实现了读，`ipmitool lan set` 会返回
+  `0xC1`。写会牵动 mgmtd 的网络配置，风险大，暂时只读。
+- **SDR 设备端写入 / PEF / IPMB 桥接 / Get-Set User Access** —— 未实现。
+
+已实现的 LAN 参数（`0x0C 0x02`，`ipmitool lan print` 全部有真实值）：
+
+| 选择子 | 参数 | 来源 |
+|---|---|---|
+| 0 | Set in Progress | 固定 0 |
+| 1 / 2 | Auth Type Support / Enable | 固定 `0x15`（none/一般口令）|
+| 3 | IP Address | 请求的**目的地址**（`IP_PKTINFO`）|
+| 4 | IP Address Source | `/var/run/udhcpc.<if>.pid` 存在则为 DHCP，否则 static |
+| 5 | MAC Address | `/sys/class/net/<if>/address` |
+| 6 | Subnet Mask | `getifaddrs()` 匹配该地址的接口 |
+| 7 | IPv4 Header Params | TTL 64、DF |
+| 8 / 9 | Primary / Secondary RMCP Port | 623 / 664 |
+| 10 / 11 | ARP Control / Gratuitous ARP | 0 |
+| 12 / 13 | Default Gateway IP / MAC | `/proc/net/route` 该接口的默认路由 |
+| 14 / 15 | Backup Gateway | 0 |
+| 16 | Community String | `public` |
+| 17 | Number of Destinations | 0 |
+| 20 / 21 | 802.1q VLAN ID / Priority | 0（管理口不打 VLAN）|
+| 22 / 23 / 24 | RMCP+ cipher suite 支持 / 列表 / 权限 | suite 3 与 suite 17 |
+
+> 参数选择子是**从 0 开始**的（`ipmitool lan.h` 与 pyipmi 一致：3 = IP 地址、20 = VLAN ID）。
+> 早前按 4 = IP 地址去实现会整体错位。
+
+`lan print` 报告的是**请求进来的那个接口**，不是写死 eth1 —— 所以从 192.168.0.x 侧连进来会
+看到 eth0 的地址。这是用 `recvmsg()` + `IP_PKTINFO` 拿目的地址实现的。
+
+## 第二、第三个 cipher suite：17/18/19（SHA-256）
+
+之前只支持 suite 3（HMAC-SHA1）。现在同时支持：
+
+| suite | RAKP 认证 | 完整性 | 加密 |
+|---|---|---|---|
+| 3 | RAKP-HMAC-SHA1 (1) | HMAC-SHA1-96 (1) | AES-CBC-128 |
+| 17 | RAKP-HMAC-SHA256 (3) | HMAC-SHA256-128 (4) | AES-CBC-128 |
+
+响应里回显协商结果，客户端（pyghmi、python-ipmi）都直接按它走。
+
+### 踩到的坑：K1/K2 的常量长度两个客户端不一致
+
+```
+K1 = HMAC(SIK, 0x01 重复 N 次)
+```
+
+- **ipmitool 和 pyghmi**：N = **20**，写死
+- **python-ipmi**：N = **摘要长度**，SHA-256 时是 32
+
+两种都"符合"规范措辞，结果就是同一台 BMC 不可能只服务一个。做法是两个都算出来
+（`k1`/`k1_alt`），用客户端**第一个**加密报文去试，哪个能通过校验就锁哪个
+（日志 `key derivation variant 0|1 in use`）。客户端永远是先发后收（RAKP4 之后第一条
+就是 Set Session Privilege Level），所以一定能锁定。
+
+这条是实测逼出来的：只按 digest 长度实现时 pyipmi 全通、pyghmi 全部 `integrity check
+failed`；只按 20 字节实现则反过来。
+
+### 另一个顺带修的：open-session 状态码
+
+"不支持的认证算法" 是 **0x04**，不是 0x03（0x03 是 "Invalid payload type"）。
+0x04 在客户端的「算法被拒 → 换下一个套件」集合里，所以就算只支持 suite 3，
+客户端也会自动回落而不是直接失败。
 
 未识别的 netfn/cmd 统一返回 `0xC1`（Invalid Command），不会挂住客户端。
 收到 `Get SDR` 的 6 字节请求时若长度不足会返回 `0xCC`，pyghmi 会自行改用 size=5 重试。
@@ -105,6 +159,26 @@ O_WRONLY)` 后做 `TIOCSBRK`，250 ms 后 `TIOCCBRK` 释放。之所以能这么
 > **误发 BREAK 后随手按键可能触发 `b`（重启）或 `c`（crash）**。所以只在客户端明确请求时
 > 才发，且长度限制在 250 ms。
 
+### 反方向：主机发来的 BREAK（已实现）
+
+主机发 BREAK 时，`is_console_manager` 读到的只是一个"断帧"，字节流里什么都没有 —— 线路
+事件在 tty 层就被消耗掉了。但驱动会为每个端口维护错误计数器，所以：
+
+```
+open("/dev/ttyS1", O_RDONLY|O_NOCTTY|O_NONBLOCK)   /* 只开不读，不抢字节 */
+ioctl(fd, TIOCGICOUNT, &icount)                     /* icount.brk */
+每 500 ms 比对一次，增加就认定主机发了 BREAK
+```
+
+检测到之后在下一包 SOL 的 `payload[3]` 置 `0x04`；如果当前没有字符数据可捎带，就单发一个
+纯头包把标志带出去。实测收到 `flags=04` 且只带一次。
+
+先确认过这台机器支持：`scripts/ipmi-lan/brkcount.c` 探针输出
+`brk=0 frame=0 overrun=0 parity=0 rx=33256 tx=25`，计数器可读且在正常串口流量下不会乱涨。
+
+> 验证方法说明：主机当前没跑系统，无法让它主动发 BREAK。所以上报路径是用一个**临时构建**
+> （把基线故意错开 1）验证的，确认客户端收到 `0x04` 后立刻换回正式二进制。
+
 ### SOL 的 ACK 流控（已实现）
 
 滑动窗口，最多 4 包（`SOL_WINDOW`）在途，每包 ≤128 字符：
@@ -120,7 +194,7 @@ O_WRONLY)` 后做 `TIOCSBRK`，250 ms 后 `TIOCCBRK` 释放。之所以能这么
 只实现 cipher suite 3（HMAC-SHA1 认证 + HMAC-SHA1-96 完整性 + AES-CBC-128 加密）——
 这是 `ipmitool -I lanplus` 和 pyghmi 的默认组合。
 
-## 和其他客户端的兼容性修正
+## 与其他客户端的兼容性修正
 
 这些都是拿两个独立客户端（pyghmi、python-ipmi）交叉验证时才暴露出来的：
 
@@ -166,6 +240,7 @@ FRU File ID 被当成 Asset Tag，再往后就越界崩在 `_decode_custom_field
 | `ipmi-sol-flow-test.py` | pyghmi 验收：SOL 滑动窗口（ACK 的客户端）+ BREAK 转发 |
 | `conprobe.c` | 控制台 socket 探针，确认 `/var/run/console_manager_socket` 是双向 fan-out |
 | `brktest.c` | BREAK 可行性验证：另开 `/dev/ttyS1` 做 `TIOCSBRK` 是否可行 |
+| `brkcount.c` | `TIOCGICOUNT` 探针：确认 UART 维护 BREAK 计数器（主机→BMC 检测的前提）|
 | `apply-runtime.sh` | **不刷机**前提下在真机上部署/调试，仅在开发时用 |
 | `deploy-ipmi-lan.ps1` | 开发期把交叉编译产物经 Web RPC 推上真机并重启 |
 

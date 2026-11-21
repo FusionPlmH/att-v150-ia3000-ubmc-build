@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
@@ -42,6 +43,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <linux/serial.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -54,6 +56,17 @@
 #define MAX_PKT          1024
 #define MAX_SOCKS        8
 #define AUTHCODE_LEN     12          /* HMAC-SHA1 truncated to 96 bit */
+#define MAX_DIGEST       32          /* HMAC-SHA256 output */
+#define MAX_ICV          16          /* HMAC-SHA256-128 */
+
+/* RAKP authentication algorithms, as sent in the Open Session Request */
+#define AUTH_ALGO_SHA1      1
+#define AUTH_ALGO_SHA256    3
+/* integrity algorithms */
+#define INTEG_ALGO_SHA1_96      1
+#define INTEG_ALGO_SHA256_128   4
+/* confidentiality algorithms */
+#define CONF_ALGO_AES_CBC_128   1
 #define MAX_USERS        16
 #define PASSWD_FILE      "/config/ipmi-lan.passwd"
 #define LOG_FILE         "/var/log/ipmi-lan.log"
@@ -87,7 +100,10 @@
 
 /* RMCP+ open-session status codes we use */
 #define RMCP_OK                0x00
-#define RMCP_INVALID_AUTH_ALGO 0x03
+/* RMCP+ open-session status codes we use.  0x04 and 0x06 are in the "algorithm
+ * rejected" set that clients treat as "try the next cipher suite". */
+#define RMCP_INVALID_AUTH_ALGO 0x04
+#define RMCP_INVALID_CONF_ALGO 0x06
 #define RMCP_INVALID_USER      0x0D
 
 typedef struct {
@@ -108,9 +124,22 @@ typedef struct {
     uint32_t rm_id;
     uint8_t  rc_rand[16];
     uint8_t  rm_rand[16];
-    uint8_t  sik[20];
-    uint8_t  k1[20];
-    uint8_t  k2[20];
+    /* SIK / K1 / K2 are as long as the RAKP digest, so they have to hold the
+     * 32 bytes of HMAC-SHA256 as well as the 20 of HMAC-SHA1 */
+    uint8_t  sik[MAX_DIGEST];
+    uint8_t  k1[MAX_DIGEST];
+    uint8_t  k2[MAX_DIGEST];
+    uint8_t  auth_algo;      /* negotiated RAKP hash: 1 = SHA-1, 3 = SHA-256 */
+    uint8_t  integ_algo;     /* 1 = HMAC-SHA1-96, 4 = HMAC-SHA256-128 */
+    int      dig_len;        /* 20 or 32 */
+    int      icv_len;        /* 12 or 16 */
+    /* K1/K2 depend on how the client reads the spec's "0x01 repeated" constant:
+     * ipmitool and pyghmi use twenty 0x01 bytes, python-ipmi uses as many as
+     * the digest is long.  Both are computed and the one that validates the
+     * client's first packet is latched in key_variant (-1 = not decided). */
+    uint8_t  k1_alt[MAX_DIGEST];
+    uint8_t  k2_alt[MAX_DIGEST];
+    int      key_variant;
     uint8_t  priv;
     uint8_t  role_byte;      /* RAKP1 role byte as received (0x10 = name-only) */
     char     user[17];
@@ -208,11 +237,35 @@ static void rand_bytes(uint8_t *p, int n)
 
 /* ----------------------------------------------------------------- crypto */
 
-static void hmac_sha1(const uint8_t *key, int keylen,
-                      const uint8_t *data, int datalen, uint8_t out[20])
+/* The RAKP hash and the integrity hash are chosen per session: cipher suite 3
+ * uses HMAC-SHA1, suites 17/18/19 use HMAC-SHA256. */
+static const EVP_MD *auth_md(uint8_t algo)
 {
-    unsigned int len = 20;
-    HMAC(EVP_sha1(), key, keylen, data, datalen, out, &len);
+    return algo == AUTH_ALGO_SHA256 ? EVP_sha256() : EVP_sha1();
+}
+
+static const EVP_MD *integ_md(uint8_t algo)
+{
+    return algo == INTEG_ALGO_SHA256_128 ? EVP_sha256() : EVP_sha1();
+}
+
+static int dig_len_of(uint8_t algo)
+{
+    return algo == AUTH_ALGO_SHA256 ? 32 : 20;
+}
+
+static int icv_len_of(uint8_t integ)
+{
+    return integ == INTEG_ALGO_SHA256_128 ? 16 : AUTHCODE_LEN;
+}
+
+static int hmac_md(const EVP_MD *md, const uint8_t *key, int keylen,
+                   const uint8_t *data, int datalen, uint8_t *out)
+{
+    unsigned int len = 0;
+
+    HMAC(md, key, keylen, data, datalen, out, &len);
+    return (int)len;
 }
 
 static int aes_cbc(int enc, const uint8_t key[16], const uint8_t iv[16],
@@ -243,14 +296,20 @@ static int aes_cbc(int enc, const uint8_t key[16], const uint8_t iv[16],
 
 /*
  * Kg = password, then
- *   sik = HMAC_SHA1(Kg, Rc || Rm || role || userlen || user)
- *   k1  = HMAC_SHA1(sik, 0x01 x 20)
- *   k2  = HMAC_SHA1(sik, 0x02 x 20)      (AES-128 key = k2[0:16])
+ *   sik = HASH(Kg,  Rc || Rm || role || userlen || user)
+ *   k1  = HASH(sik, 0x01 x n)
+ *   k2  = HASH(sik, 0x02 x n)            (AES-128 key = k2[0:16])
+ * where HASH is HMAC-SHA1 (n = 20) for cipher suite 3 and HMAC-SHA256
+ * (n = 32) for suites 17/18/19.
  */
 static void derive_keys(session_t *s, const char *pass, uint8_t role)
 {
-    uint8_t buf[128], one[20], two[20];
-    int n = 0, ul = (int)strlen(s->user), i;
+    uint8_t buf[128], one[MAX_DIGEST], two[MAX_DIGEST];
+    int n = 0, ul = (int)strlen(s->user);
+    const EVP_MD *md = auth_md(s->auth_algo);
+
+    s->dig_len = dig_len_of(s->auth_algo);
+    s->icv_len = icv_len_of(s->integ_algo);
 
     memcpy(buf + n, s->rc_rand, 16); n += 16;
     memcpy(buf + n, s->rm_rand, 16); n += 16;
@@ -258,13 +317,26 @@ static void derive_keys(session_t *s, const char *pass, uint8_t role)
     buf[n++] = (uint8_t)ul;
     memcpy(buf + n, s->user, ul); n += ul;
 
-    hmac_sha1((const uint8_t *)pass, (int)strlen(pass), buf, n, s->sik);
+    hmac_md(md, (const uint8_t *)pass, (int)strlen(pass), buf, n, s->sik);
 
-    memset(one, 0x01, sizeof(one));
-    memset(two, 0x02, sizeof(two));
-    hmac_sha1(s->sik, 20, one, 20, s->k1);
-    hmac_sha1(s->sik, 20, two, 20, s->k2);
-    (void)i;
+    /* variant 0: twenty 0x01 / 0x02 bytes (what ipmitool and pyghmi do) */
+    memset(one, 0x01, 20);
+    memset(two, 0x02, 20);
+    hmac_md(md, s->sik, s->dig_len, one, 20, s->k1);
+    hmac_md(md, s->sik, s->dig_len, two, 20, s->k2);
+
+    if (s->dig_len == 20) {
+        memcpy(s->k1_alt, s->k1, sizeof(s->k1));
+        memcpy(s->k2_alt, s->k2, sizeof(s->k2));
+        s->key_variant = 0;
+    } else {
+        /* variant 1: as many 0x01 / 0x02 bytes as the digest is long */
+        memset(one, 0x01, (size_t)s->dig_len);
+        memset(two, 0x02, (size_t)s->dig_len);
+        hmac_md(md, s->sik, s->dig_len, one, s->dig_len, s->k1_alt);
+        hmac_md(md, s->sik, s->dig_len, two, s->dig_len, s->k2_alt);
+        s->key_variant = -1;            /* decide on the first packet */
+    }
 }
 
 /* ------------------------------------------------------------ user store */
@@ -386,6 +458,7 @@ static int host_power_is_on(void)
 
 #define NETFN_SENSOR    0x04
 #define NETFN_STORAGE   0x0A
+#define NETFN_TRANSPORT 0x0C
 
 /* hwmon-backed sensor, rebuilt at startup so `ipmitool sensor` has an SDR */
 typedef struct {
@@ -846,6 +919,13 @@ static int        g_ipmi_fd = -1;
 static int        g_break_fd = -1;      /* /dev/ttyS1, opened lazily for BREAK */
 static long       g_break_release_ms;
 
+/* host -> console BREAK detection (see sol_hostbreak_poll) */
+static int        g_hostbrk_fd = -1;
+static int        g_hostbrk_last;
+static int        g_hostbrk_pending;
+static long       g_hostbrk_poll_ms;
+static long       g_hostbrk_retry_ms;
+
 static void sol_deactivate(session_t *s);
 static void sol_flush(void);
 static void sol_pump(void);
@@ -897,6 +977,81 @@ static void sol_break_service(void)
 }
 
 /*
+ * A BREAK sent by the host never arrives as data: is_console_manager reads the
+ * port as a byte stream and the line event is consumed by the tty layer.  The
+ * driver does keep a per-port error counter for it though, so poll
+ * TIOCGICOUNT and treat a bump of icount.brk as "the host sent a BREAK".
+ *
+ * Opening the port read-only is safe as long as we never read() from it, so
+ * the console manager keeps every byte.
+ */
+static void sol_hostbreak_poll(void)
+{
+    struct serial_icounter_struct ic;
+    long now = now_ms();
+    int delta;
+
+    if (g_hostbrk_fd < 0) {
+        if (g_hostbrk_retry_ms != 0 && now < g_hostbrk_retry_ms)
+            return;
+        g_hostbrk_fd = open(HOST_UART, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+        if (g_hostbrk_fd < 0) {
+            g_hostbrk_retry_ms = now + 60000;
+            logmsg("host BREAK detection off, open %s: %s", HOST_UART,
+                   strerror(errno));
+            return;
+        }
+        memset(&ic, 0, sizeof(ic));
+        if (ioctl(g_hostbrk_fd, TIOCGICOUNT, &ic) < 0) {
+            logmsg("host BREAK detection off, TIOCGICOUNT: %s", strerror(errno));
+            close(g_hostbrk_fd);
+            g_hostbrk_fd = -1;
+            g_hostbrk_retry_ms = now + 60000;
+            return;
+        }
+        g_hostbrk_last = ic.brk;
+        g_hostbrk_poll_ms = now;
+        logmsg("host BREAK detection on, brk=%d", ic.brk);
+        return;
+    }
+
+    if (now - g_hostbrk_poll_ms < 500)
+        return;
+    g_hostbrk_poll_ms = now;
+
+    memset(&ic, 0, sizeof(ic));
+    if (ioctl(g_hostbrk_fd, TIOCGICOUNT, &ic) < 0)
+        return;
+    if (ic.brk == g_hostbrk_last)
+        return;
+
+    delta = ic.brk - g_hostbrk_last;
+    if (delta < 0)
+        delta = 1;                      /* counter wrapped, report one */
+    if (delta > 8)
+        delta = 8;
+    g_hostbrk_pending += delta;
+    if (g_hostbrk_pending > 8)
+        g_hostbrk_pending = 8;
+    logmsg("host BREAK received (%d -> %d)", g_hostbrk_last, ic.brk);
+    g_hostbrk_last = ic.brk;
+}
+
+/* forget breaks seen while no session was listening */
+static void sol_hostbreak_rebaseline(void)
+{
+    struct serial_icounter_struct ic;
+
+    g_hostbrk_pending = 0;
+    g_hostbrk_poll_ms = now_ms();
+    if (g_hostbrk_fd < 0)
+        return;
+    memset(&ic, 0, sizeof(ic));
+    if (ioctl(g_hostbrk_fd, TIOCGICOUNT, &ic) == 0)
+        g_hostbrk_last = ic.brk;
+}
+
+/*
  * The host serial is multiplexed by is_console_manager: it reads /dev/ttyS1 and
  * fans the bytes out over CONSOLE_SOCK, where every ttyd/serial_socket_client
  * pair already connects.  Joining that as one more client gives SOL both read
@@ -941,6 +1096,7 @@ static int sol_activate(session_t *s)
     s->sol_noack = 0;
     memset(s->sol_inflight, 0, sizeof(s->sol_inflight));
     g_sol_owner  = s;
+    sol_hostbreak_rebaseline();
     logmsg("sol: activated for rm=%08x", s->rm_id);
     return 0;
 }
@@ -964,6 +1120,241 @@ static void sol_deactivate(session_t *s)
     }
     if (g_sol_owner == s)
         g_sol_owner = NULL;
+}
+
+/* ------------------------------------------------- channel network info */
+
+/*
+ * The LAN configuration parameters describe the interface a request came in
+ * on, so the destination address of the request is captured from IP_PKTINFO
+ * in the main loop and remembered here (single threaded, so one slot is
+ * enough).
+ */
+static struct in_addr g_local_ip;
+
+/* find the interface that owns `want`, its netmask and its MAC */
+static int iface_for_addr(struct in_addr want, char *name, size_t namelen,
+                          struct in_addr *mask, unsigned char mac[6])
+{
+    struct ifaddrs *ifs, *ifp;
+    int found = -1;
+    char path[64], buf[32];
+    unsigned m[6];
+
+    if (getifaddrs(&ifs) != 0)
+        return -1;
+    for (ifp = ifs; ifp != NULL; ifp = ifp->ifa_next) {
+        struct sockaddr_in *sin;
+
+        if (ifp->ifa_addr == NULL || ifp->ifa_addr->sa_family != AF_INET)
+            continue;
+        sin = (struct sockaddr_in *)ifp->ifa_addr;
+        if (sin->sin_addr.s_addr != want.s_addr)
+            continue;
+        snprintf(name, namelen, "%s", ifp->ifa_name);
+        mask->s_addr = 0;
+        if (ifp->ifa_netmask != NULL)
+            mask->s_addr =
+                ((struct sockaddr_in *)ifp->ifa_netmask)->sin_addr.s_addr;
+        found = 0;
+        break;
+    }
+    freeifaddrs(ifs);
+    if (found != 0)
+        return -1;
+
+    memset(mac, 0, 6);
+    snprintf(path, sizeof(path), "/sys/class/net/%s/address", name);
+    {
+        FILE *f = fopen(path, "r");
+        if (f != NULL) {
+            if (fgets(buf, sizeof(buf), f) != NULL &&
+                sscanf(buf, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                int i;
+                for (i = 0; i < 6; i++)
+                    mac[i] = (unsigned char)m[i];
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+/* the interface's default gateway, or 0.0.0.0 when it has none */
+static struct in_addr iface_gateway(const char *name)
+{
+    struct in_addr gw;
+    char line[256];
+    FILE *f;
+
+    gw.s_addr = 0;
+    if (*name == '\0')
+        return gw;
+    f = fopen("/proc/net/route", "r");
+    if (f == NULL)
+        return gw;
+    if (fgets(line, sizeof(line), f) == NULL) {          /* column header */
+        fclose(f);
+        return gw;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char ifname[32], dest[16], gate[16];
+        unsigned flags;
+
+        if (sscanf(line, "%31s %15s %15s %x", ifname, dest, gate, &flags) != 4)
+            continue;
+        if (strcmp(ifname, name) != 0 || strcmp(dest, "00000000") != 0)
+            continue;
+        gw.s_addr = (in_addr_t)strtoul(gate, NULL, 16);
+        break;
+    }
+    fclose(f);
+    return gw;
+}
+
+static int iface_is_dhcp(const char *name)
+{
+    char path[64];
+    struct stat st;
+
+    if (*name == '\0')
+        return 0;
+    snprintf(path, sizeof(path), "/var/run/udhcpc.%s.pid", name);
+    return stat(path, &st) == 0;
+}
+
+/* LAN configuration parameter numbers, as they go on the wire (ipmitool's
+ * ipmi_lan.h uses the same values: 3 is the IP address, 20 the 802.1q ID) */
+#define LANP_SET_IN_PROGRESS      0
+#define LANP_AUTH_TYPE_SUPPORT    1
+#define LANP_AUTH_TYPE_ENABLE     2
+#define LANP_IP_ADDRESS           3
+#define LANP_IP_ADDRESS_SOURCE    4
+#define LANP_MAC_ADDRESS          5
+#define LANP_SUBNET_MASK          6
+#define LANP_IPV4_HEADER_PARAMS   7
+#define LANP_PRIMARY_RMCP_PORT    8
+#define LANP_SECONDARY_RMCP_PORT  9
+#define LANP_BMC_ARP_CONTROL     10
+#define LANP_GRATUITOUS_ARP      11
+#define LANP_DEFAULT_GATEWAY     12
+#define LANP_DEFAULT_GATEWAY_MAC 13
+#define LANP_BACKUP_GATEWAY      14
+#define LANP_BACKUP_GATEWAY_MAC  15
+#define LANP_COMMUNITY_STRING    16
+#define LANP_NUM_DESTINATIONS    17
+#define LANP_8021Q_VLAN_ID       20
+#define LANP_8021Q_VLAN_PRIORITY 21
+#define LANP_RMCP_PLUS_SUPPORT   22
+#define LANP_RMCP_PLUS_SUITES    23
+#define LANP_RMCP_PLUS_PRIVS     24
+
+/* build the parameter data; returns its length, or -1 when not supported */
+static int lan_param(uint8_t *out, int max, uint8_t sel)
+{
+    char ifname[IF_NAMESIZE];
+    struct in_addr ip, mask, gw;
+    unsigned char mac[6];
+    int len = 0;
+
+    ip = g_local_ip;
+    if (ip.s_addr == 0)
+        return -1;                  /* no IP_PKTINFO: nothing to describe */
+
+    memset(ifname, 0, sizeof(ifname));
+    mask.s_addr = 0;
+    memset(mac, 0, 6);
+    iface_for_addr(ip, ifname, sizeof(ifname), &mask, mac);
+    gw = iface_gateway(ifname);
+
+    switch (sel) {
+    case LANP_SET_IN_PROGRESS:
+        out[len++] = 0x00;
+        break;
+    case LANP_AUTH_TYPE_SUPPORT:
+        out[len++] = 0x15;          /* none + MD2 + MD5 + password */
+        break;
+    case LANP_AUTH_TYPE_ENABLE:
+        memset(out + len, 0x15, 5); /* callback, user, operator, admin, OEM */
+        len += 5;
+        break;
+    case LANP_IP_ADDRESS:
+        memcpy(out + len, &ip.s_addr, 4);
+        len += 4;
+        break;
+    case LANP_IP_ADDRESS_SOURCE:
+        out[len++] = iface_is_dhcp(ifname) ? 2 : 1;   /* DHCP / static */
+        break;
+    case LANP_MAC_ADDRESS:
+        memcpy(out + len, mac, 6);
+        len += 6;
+        break;
+    case LANP_SUBNET_MASK:
+        memcpy(out + len, &mask.s_addr, 4);
+        len += 4;
+        break;
+    case LANP_IPV4_HEADER_PARAMS:
+        out[len++] = 0x40;          /* TTL 64 */
+        out[len++] = 0x40;          /* don't fragment */
+        out[len++] = 0x00;
+        break;
+    case LANP_PRIMARY_RMCP_PORT:
+        out[len++] = (uint8_t)(IPMI_PORT & 0xff);
+        out[len++] = (uint8_t)(IPMI_PORT >> 8);
+        break;
+    case LANP_SECONDARY_RMCP_PORT:
+        out[len++] = 0x98;          /* 664, the IPMI default */
+        out[len++] = 0x02;
+        break;
+    case LANP_BMC_ARP_CONTROL:
+    case LANP_GRATUITOUS_ARP:
+        out[len++] = 0x00;
+        break;
+    case LANP_DEFAULT_GATEWAY:
+        memcpy(out + len, &gw.s_addr, 4);
+        len += 4;
+        break;
+    case LANP_BACKUP_GATEWAY:
+        memset(out + len, 0, 4);
+        len += 4;
+        break;
+    case LANP_DEFAULT_GATEWAY_MAC:
+    case LANP_BACKUP_GATEWAY_MAC:
+        memset(out + len, 0, 6);    /* ARP cache lookup is not worth it */
+        len += 6;
+        break;
+    case LANP_COMMUNITY_STRING:
+        memset(out + len, 0, 18);   /* SNMP community, fixed length */
+        memcpy(out + len, "public", 6);
+        len += 18;
+        break;
+    case LANP_NUM_DESTINATIONS:
+        out[len++] = 0x00;
+        break;
+    case LANP_8021Q_VLAN_ID:
+        out[len++] = 0x00;          /* no VLAN tag on the management port */
+        out[len++] = 0x00;
+        break;
+    case LANP_8021Q_VLAN_PRIORITY:
+        out[len++] = 0x00;
+        break;
+    case LANP_RMCP_PLUS_SUPPORT:
+        out[len++] = 0x08;          /* one set of three algorithms */
+        break;
+    case LANP_RMCP_PLUS_SUITES:
+        out[len++] = 0x02;          /* two entries */
+        out[len++] = 0x03;          /* suite 3:  SHA-1 + AES-CBC-128 */
+        out[len++] = 0x11;          /* suite 17: SHA-256 + AES-CBC-128 */
+        break;
+    case LANP_RMCP_PLUS_PRIVS:
+        out[len++] = 0x04;          /* suite 3:  up to admin */
+        out[len++] = 0x04;          /* suite 17: up to admin */
+        break;
+    default:
+        return -1;
+    }
+    return len <= max ? len : -1;
 }
 
 static int dispatch_ipmi(const uint8_t *req, int reqlen,
@@ -1476,6 +1867,39 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
         }
         break;
 
+    case NETFN_TRANSPORT:
+        switch (cmd) {
+        case 0x02: {                            /* Get LAN Configuration Params */
+            uint8_t ch       = (reqlen - 7) > 0 ? (uint8_t)(req[6] & 0x0f) : 0;
+            uint8_t sel      = (reqlen - 7) > 1 ? req[7] : 0;
+            int     rev_only = (reqlen - 7) > 0 && (req[6] & 0x80);
+            uint8_t pd[64];
+            int     plen2, start = n;
+
+            if (ch != 1 && ch != 0x0e && ch != 0x0f) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rsp[n++] = 0x11;                /* parameter revision 1 */
+            if (rev_only)
+                break;
+            plen2 = lan_param(pd, (int)sizeof(pd), sel);
+            if (plen2 < 0) {
+                n = start;                  /* drop the revision byte again */
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            memcpy(rsp + n, pd, (size_t)plen2);
+            n += plen2;
+            break;
+        }
+
+        default:
+            rsp[6] = CC_INVALID_CMD;
+            break;
+        }
+        break;
+
     default:
         rsp[6] = CC_INVALID_CMD;
         break;
@@ -1599,23 +2023,40 @@ static void handle_open_request(int fd, const struct sockaddr_in *to,
     uint8_t   rsp[64];
     int       n = 0;
     uint8_t   status = RMCP_OK;
-    uint8_t   auth_algo = 1;                        /* HMAC-SHA1 */
+    uint8_t   auth_algo = AUTH_ALGO_SHA1;
+    uint8_t   integ_algo = INTEG_ALGO_SHA1_96;
+    uint8_t   conf_algo = CONF_ALGO_AES_CBC_128;
     session_t *s;
 
     if (plen < 16)
         return;
 
-    /* Algorithm payloads start at offset 8: type(1) rsvd(2) len(2) algo(1) ... */
+    /* Each algorithm payload is 8 bytes: type(1) rsvd(2) len(1) algo(1)
+     * rsvd(3).  Clients send exactly one request these details, but only the
+     * algorithm byte matters here. */
     auth_algo = pl[12];
+    if (plen > 20)
+        integ_algo = pl[20];
+    if (plen > 28)
+        conf_algo = pl[28];
 
-    if (auth_algo != 1) {
-        /* Only cipher suite 3 (RAKP-HMAC-SHA1 + HMAC-SHA1-96 + AES-CBC-128) is
-         * offered.  Report it as an unsupported algorithm rather than with the
-         * catch-all code, so a client that asked for SHA-256 (pyipmi does by
-         * default) says so instead of failing on some unrelated step. */
+    if (auth_algo == AUTH_ALGO_SHA256) {
+        auth_algo  = AUTH_ALGO_SHA256;
+        integ_algo = INTEG_ALGO_SHA256_128;
+    } else if (auth_algo == AUTH_ALGO_SHA1) {
+        auth_algo  = AUTH_ALGO_SHA1;
+        integ_algo = INTEG_ALGO_SHA1_96;
+    } else {
+        /* Report it as an unsupported algorithm rather than with the
+         * catch-all code: 0x04 is in the "algorithm rejected" set that clients
+         * use to fall back to another cipher suite. */
         status = RMCP_INVALID_AUTH_ALGO;
-        logmsg("open request rejected: auth algo %u, only SHA-1 (cipher "
-               "suite 3) is supported", auth_algo);
+        logmsg("open request rejected: auth algo %u, only SHA-1 (suite 3) "
+               "and SHA-256 (suite 17) are supported", auth_algo);
+    }
+    if (status == RMCP_OK && conf_algo != CONF_ALGO_AES_CBC_128) {
+        status = RMCP_INVALID_CONF_ALGO;
+        logmsg("open request rejected: confidentiality algo %u", conf_algo);
     }
 
     rsp[n++] = pl[0];
@@ -1639,18 +2080,23 @@ static void handle_open_request(int fd, const struct sockaddr_in *to,
     s->rc_id  = rd_le32(pl + 4);
     s->rm_id  = ++g_next_id;
     s->priv   = 4;
+    s->auth_algo  = auth_algo;
+    s->integ_algo = integ_algo;
+    s->dig_len    = dig_len_of(auth_algo);
+    s->icv_len    = icv_len_of(integ_algo);
     s->last   = time(NULL);
 
     wr_le32(rsp + n, s->rm_id); n += 4;
-    /* auth / integrity / confidentiality blocks, suite 3 */
+    /* echo the negotiated algorithms back, one 8 byte payload each */
     rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x08;
-    rsp[n++] = 0x01; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+    rsp[n++] = auth_algo; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
     rsp[n++] = 0x01; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x08;
-    rsp[n++] = 0x01; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+    rsp[n++] = integ_algo; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
     rsp[n++] = 0x02; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x08;
-    rsp[n++] = 0x01; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
+    rsp[n++] = conf_algo; rsp[n++] = 0x00; rsp[n++] = 0x00; rsp[n++] = 0x00;
 
-    logmsg("open session rc=%08x rm=%08x", s->rc_id, s->rm_id);
+    logmsg("open session rc=%08x rm=%08x auth=%u integ=%u",
+           s->rc_id, s->rm_id, auth_algo, integ_algo);
     send_plain(fd, to, PT_OPEN_RSP, 0, 0, rsp, n);
 }
 
@@ -1671,8 +2117,8 @@ static void rakp_error(int fd, const struct sockaddr_in *to, uint8_t tag,
 static void handle_rakp1(int fd, const struct sockaddr_in *to,
                          const uint8_t *pl, int plen)
 {
-    uint8_t   rsp[MAX_PKT], mac[20], buf[128];
-    int       n = 0, blen, userlen;
+    uint8_t   rsp[MAX_PKT], mac[MAX_DIGEST], buf[128];
+    int       n = 0, blen, userlen, mlen;
     uint32_t  rm_id;
     uint8_t   role;
     char      user[17];
@@ -1716,8 +2162,9 @@ static void handle_rakp1(int fd, const struct sockaddr_in *to,
     memcpy(rsp + n, s->rm_rand, 16); n += 16;
     memcpy(rsp + n, g_guid, 16); n += 16;
 
-    /* RAKP2 authcode = HMAC-SHA1(password,
-     *   RcID || RmID || Rc || Rm || GUID || role || userlen || user) */
+    /* RAKP2 authcode = HMAC(password,
+     *   RcID || RmID || Rc || Rm || GUID || role || userlen || user)
+     * with the full digest length of the negotiated algorithm. */
     wr_le32(buf + 0,  s->rc_id);
     wr_le32(buf + 4,  s->rm_id);
     memcpy(buf + 8,  s->rc_rand, 16);
@@ -1727,18 +2174,19 @@ static void handle_rakp1(int fd, const struct sockaddr_in *to,
     buf[57] = (uint8_t)userlen;
     memcpy(buf + 58, user, userlen);
     blen = 58 + userlen;
-    hmac_sha1((const uint8_t *)pass, (int)strlen(pass), buf, blen, mac);
-    memcpy(rsp + n, mac, 20); n += 20;
+    mlen = hmac_md(auth_md(s->auth_algo), (const uint8_t *)pass,
+                   (int)strlen(pass), buf, blen, mac);
+    memcpy(rsp + n, mac, (size_t)mlen); n += mlen;
 
-    logmsg("rakp1 user=%s role=%u", user, role);
+    logmsg("rakp1 user=%s role=%u auth=%u", user, role, s->auth_algo);
     send_plain(fd, to, PT_RAKP2, s->rm_id, 0, rsp, n);
 }
 
 static void handle_rakp3(int fd, const struct sockaddr_in *to,
                          const uint8_t *pl, int plen)
 {
-    uint8_t   rsp[64], buf[128], expect[20], b2[40];
-    int       n = 0, blen, ul;
+    uint8_t   rsp[80], buf[128], expect[MAX_DIGEST], b2[40];
+    int       n = 0, blen, ul, mlen;
     uint32_t  rm_id;
     const char *pass;
     session_t *s;
@@ -1757,7 +2205,7 @@ static void handle_rakp3(int fd, const struct sockaddr_in *to,
         return;
     }
 
-    /* RAKP3 authcode = HMAC-SHA1(password,
+    /* RAKP3 authcode = HMAC(password,
      *   Rm || RcID || role || userlen || user) */
     ul = (int)strlen(s->user);
     blen = 0;
@@ -1766,16 +2214,17 @@ static void handle_rakp3(int fd, const struct sockaddr_in *to,
     buf[blen++] = s->role_byte;
     buf[blen++] = (uint8_t)ul;
     memcpy(buf + blen, s->user, ul);    blen += ul;
-    hmac_sha1((const uint8_t *)pass, (int)strlen(pass), buf, blen, expect);
+    hmac_md(auth_md(s->auth_algo), (const uint8_t *)pass, (int)strlen(pass),
+            buf, blen, expect);
 
-    if (memcmp(expect, pl + 8, 20) != 0) {
+    if (plen < 8 + s->dig_len || memcmp(expect, pl + 8, (size_t)s->dig_len) != 0) {
         logmsg("rakp3: bad password for '%s'", s->user);
         rakp_error(fd, to, pl[0], 0x01, s->rc_id, s->rm_id);  /* invalid session */
         drop_session(s);
         return;
     }
 
-    /* RAKP4 authcode = HMAC-SHA1(sik, Rc || RmID || GUID)[:12] */
+    /* RAKP4 authcode = HMAC(sik, Rc || RmID || GUID)[:icv length] */
     rsp[n++] = pl[0];
     rsp[n++] = RMCP_OK;
     rsp[n++] = 0x00;
@@ -1784,12 +2233,24 @@ static void handle_rakp3(int fd, const struct sockaddr_in *to,
     memcpy(b2 + 0, s->rc_rand, 16);
     wr_le32(b2 + 16, s->rm_id);
     memcpy(b2 + 20, g_guid, 16);
-    hmac_sha1(s->sik, 20, b2, 36, expect);
-    memcpy(rsp + n, expect, AUTHCODE_LEN); n += AUTHCODE_LEN;
+    mlen = hmac_md(auth_md(s->auth_algo), s->sik, s->dig_len, b2, 36, expect);
+    if (s->icv_len > mlen)
+        s->icv_len = mlen;
+    memcpy(rsp + n, expect, (size_t)s->icv_len); n += s->icv_len;
 
-    logmsg("session established: user=%s rm=%08x priv=%u",
-           s->user, s->rm_id, s->priv);
+    logmsg("session established: user=%s rm=%08x priv=%u auth=%u integ=%u",
+           s->user, s->rm_id, s->priv, s->auth_algo, s->integ_algo);
     send_plain(fd, to, PT_RAKP4, s->rm_id, 0, rsp, n);
+}
+
+/* the K1/K2 pair the client actually uses (see key_variant) */
+static void session_keys(const session_t *s, const uint8_t **k1,
+                         const uint8_t **k2)
+{
+    int alt = s->key_variant > 0;
+
+    *k1 = alt ? s->k1_alt : s->k1;
+    *k2 = alt ? s->k2_alt : s->k2;
 }
 
 /* wrap a payload into an encrypted, integrity protected RMCP+ packet */
@@ -1797,14 +2258,16 @@ static void send_session_payload(int fd, const struct sockaddr_in *to,
                                  session_t *s, uint8_t ptype,
                                  const uint8_t *payload, int plen)
 {
-    uint8_t out[MAX_PKT], iv[16], mac[20], enc[MAX_PKT + 32];
+    uint8_t out[MAX_PKT], iv[16], mac[MAX_DIGEST], enc[MAX_PKT + 32];
     uint8_t cipher[MAX_PKT + 32], *o;
-    int i, pad, enclen, n;
+    int i, pad, enclen, n, mlen, icv;
+    const uint8_t *k1, *k2;
 
     if (plen <= 0 || plen + 17 > (int)sizeof(enc)) {
         logmsg("sol: payload too large (%d)", plen);
         return;
     }
+    session_keys(s, &k1, &k2);
     pad = (plen + 1) % 16;
     if (pad)
         pad = 16 - pad;
@@ -1818,7 +2281,7 @@ static void send_session_payload(int fd, const struct sockaddr_in *to,
     enclen = plen + pad + 1;
 
     rand_bytes(iv, 16);
-    aes_cbc(1, s->k2, iv, enc, enclen, cipher);
+    aes_cbc(1, k2, iv, enc, enclen, cipher);
 
     o = rmcp_plus_hdr(out, (uint8_t)(ptype | 0x40 | 0x80), s->rc_id,
                       ++s->out_seq, 16 + enclen);
@@ -1833,8 +2296,12 @@ static void send_session_payload(int fd, const struct sockaddr_in *to,
         *o++ = 0xff;
     *o++ = (uint8_t)pad;
     *o++ = 0x07;
-    hmac_sha1(s->k1, 20, out + 4, (int)(o - out) - 4, mac);
-    memcpy(o, mac, AUTHCODE_LEN); o += AUTHCODE_LEN;
+    icv = s->icv_len;
+    mlen = hmac_md(integ_md(s->integ_algo), k1, s->dig_len,
+                   out + 4, (int)(o - out) - 4, mac);
+    if (icv > mlen)
+        icv = mlen;
+    memcpy(o, mac, (size_t)icv); o += icv;
     if (sendto(fd, out, (size_t)(o - out), 0,
                (const struct sockaddr *)to, sizeof(*to)) < 0)
         logmsg("sol: sendto(type %02x) failed: %s", ptype, strerror(errno));
@@ -1872,7 +2339,24 @@ static void sol_flush(void)
     uint8_t pl[4 + SOL_MAX_OUT + 8];
     int len;
 
-    if (s == NULL || s->sol_cfd < 0 || s->sol_outlen <= 0 || !s->have_peer)
+    if (s == NULL || s->sol_cfd < 0 || !s->have_peer)
+        return;
+
+    /* A BREAK from the host has to be reported even when there is no
+     * character data to piggyback it on: send a bare header in that case. */
+    if (g_hostbrk_pending > 0 && s->sol_outlen <= 0) {
+        pl[0] = 0;
+        pl[1] = s->sol_ack_seq;
+        pl[2] = 0;
+        pl[3] = 0x04;
+        send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, pl, 4);
+        if (debug_on())
+            logmsg("sol: reporting host BREAK (%d pending)",
+                   g_hostbrk_pending);
+        g_hostbrk_pending--;
+        return;
+    }
+    if (s->sol_outlen <= 0)
         return;
 
     while (s->sol_outlen > 0 &&
@@ -1891,6 +2375,10 @@ static void sol_flush(void)
         pl[3] = 0;
         if (!host_power_is_on())
             pl[3] |= 0x20;                      /* system power is off */
+        if (g_hostbrk_pending > 0) {
+            pl[3] |= 0x04;                      /* host BREAK detected */
+            g_hostbrk_pending--;
+        }
         memcpy(pl + 4, s->sol_outbuf, (size_t)len);
 
         send_session_payload(g_ipmi_fd, &s->peer, s, PT_SOL, pl, 4 + len);
@@ -2023,7 +2511,7 @@ static void sol_recv_payload(session_t *s, const uint8_t *pl, int plen)
 static void handle_encapsulated(int fd, const struct sockaddr_in *to,
                                 const uint8_t *pkt, int len)
 {
-    uint8_t   rspmsg[MAX_PKT], plain[MAX_PKT], iv[16], mac[20];
+    uint8_t   rspmsg[MAX_PKT], plain[MAX_PKT], iv[16], mac[MAX_DIGEST];
     int       plen, flen, padlen, msglen, rlen = 0;
     uint8_t   ptype;
     uint32_t  sid;
@@ -2044,22 +2532,59 @@ static void handle_encapsulated(int fd, const struct sockaddr_in *to,
     s->peer = *to;                                  /* remember for async SOL */
     s->have_peer = 1;
 
-    /* integrity: HMAC-SHA1-96 over everything after the RMCP header */
-    if (len - 12 - 4 > 0) {
-        hmac_sha1(s->k1, 20, pkt + 4, len - 12 - 4, mac);
-        if (memcmp(mac, pkt + len - 12, AUTHCODE_LEN) != 0) {
-            logmsg("integrity check failed, dropping packet");
-            return;
+    /* integrity: HMAC-SHA1-96 or HMAC-SHA256-128 over everything after the
+     * RMCP header, depending on the negotiated cipher suite.  For SHA-256 the
+     * K1 derivation is not agreed between clients, so the variant that
+     * validates this first packet is latched for the rest of the session. */
+    if (len - s->icv_len - 4 > 0) {
+        int m2, vari = -1;
+
+        if (s->key_variant < 0) {
+            m2 = hmac_md(integ_md(s->integ_algo), s->k1, s->dig_len,
+                         pkt + 4, len - s->icv_len - 4, mac);
+            if (m2 >= s->icv_len &&
+                memcmp(mac, pkt + len - s->icv_len, (size_t)s->icv_len) == 0) {
+                vari = 0;
+            } else {
+                m2 = hmac_md(integ_md(s->integ_algo), s->k1_alt, s->dig_len,
+                             pkt + 4, len - s->icv_len - 4, mac);
+                if (m2 >= s->icv_len &&
+                    memcmp(mac, pkt + len - s->icv_len,
+                           (size_t)s->icv_len) == 0)
+                    vari = 1;
+            }
+            if (vari < 0) {
+                logmsg("integrity check failed, dropping packet");
+                return;
+            }
+            s->key_variant = vari;
+            logmsg("key derivation variant %d in use", vari);
+        } else {
+            const uint8_t *k1, *k2;
+            session_keys(s, &k1, &k2);
+            m2 = hmac_md(integ_md(s->integ_algo), k1, s->dig_len,
+                         pkt + 4, len - s->icv_len - 4, mac);
+            if (m2 < s->icv_len)
+                return;
+            if (memcmp(mac, pkt + len - s->icv_len, (size_t)s->icv_len) != 0) {
+                logmsg("integrity check failed, dropping packet");
+                return;
+            }
         }
     }
 
     /* confidentiality: 16-byte IV then AES-CBC-128 */
-    memcpy(iv, pkt + 16, 16);
     {
-        int clen = plen - 16;
+        const uint8_t *k1, *k2;
+        int clen;
+
+        session_keys(s, &k1, &k2);
+        (void)k1;
+        memcpy(iv, pkt + 16, 16);
+        clen = plen - 16;
         if (clen <= 0 || clen > (int)sizeof(plain) || (clen % 16) != 0)
             return;
-        flen = aes_cbc(0, s->k2, iv, pkt + 32, clen, plain);
+        flen = aes_cbc(0, k2, iv, pkt + 32, clen, plain);
         if (flen != clen) {
             logmsg("decrypt failed");
             return;
@@ -2210,6 +2735,9 @@ static int open_listener(const char *devname)
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         logmsg("SO_REUSEADDR on %s", *devname ? devname : "any");
     }
+    /* needed to learn the local address a request was sent to, which is what
+     * the LAN configuration parameters have to describe */
+    setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
 
     if (*devname &&
         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname,
@@ -2332,19 +2860,46 @@ int main(int argc, char **argv)
         }
         sol_retransmit();
         sol_break_service();
+        if (g_sol_owner != NULL)
+            sol_hostbreak_poll();
         if (r <= 0)
             continue;
 
         for (i = 0; i < nfds; i++) {
             uint8_t buf[MAX_PKT];
             struct sockaddr_in from;
-            socklen_t fl = sizeof(from);
+            struct iovec iov;
+            struct msghdr mh;
+            struct cmsghdr *cm;
+            char cbuf[256];
             int n;
 
             if (!FD_ISSET(fds[i], &rfds))
                 continue;
-            n = (int)recvfrom(fds[i], buf, sizeof(buf), 0,
-                              (struct sockaddr *)&from, &fl);
+
+            /* recvmsg rather than recvfrom so IP_PKTINFO tells us which local
+             * address the packet was addressed to: the LAN configuration
+             * parameters have to describe that interface, not eth1 blindly. */
+            memset(&mh, 0, sizeof(mh));
+            iov.iov_base = buf;
+            iov.iov_len = sizeof(buf);
+            mh.msg_name = &from;
+            mh.msg_namelen = sizeof(from);
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            mh.msg_control = cbuf;
+            mh.msg_controllen = sizeof(cbuf);
+            n = (int)recvmsg(fds[i], &mh, 0);
+            g_local_ip.s_addr = 0;
+            for (cm = CMSG_FIRSTHDR(&mh); cm != NULL;
+                 cm = CMSG_NXTHDR(&mh, cm)) {
+                if (cm->cmsg_level == IPPROTO_IP &&
+                    cm->cmsg_type == IP_PKTINFO) {
+                    struct in_pktinfo pi;
+                    memcpy(&pi, CMSG_DATA(cm), sizeof(pi));
+                    g_local_ip = pi.ipi_addr;
+                }
+            }
             if (debug_on()) {
                 char sa[32];
                 inet_ntop(AF_INET, &from.sin_addr, sa, sizeof(sa));

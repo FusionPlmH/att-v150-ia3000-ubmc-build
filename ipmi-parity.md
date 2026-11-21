@@ -228,12 +228,16 @@ etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
 | NetFn | 命令 | 能力 |
 |---|---|---|
 | App | `0x01` `0x38` `0x3B` `0x3C` `0x3D` `0x42` | 设备信息、通道能力、特权级、关会话、通道信息 |
+| Transport | `0x02` | LAN 参数（IP/掩码/MAC/网关/VLAN/cipher suites）|
 | Chassis | `0x00` `0x01` `0x02` `0x08` `0x09` | 能力/状态、电源控制、boot flags 与 bootdev |
 | Storage | `0x10` `0x11` | FRU（读 EEPROM TlvInfo，拼 Board + Product 区）|
 | Storage | `0x20`-`0x23` `0x40` `0x42` `0x43` `0x47`-`0x49` | SDR 仓库、SEL 读写/清空、SEL 时间 |
 | Sensor | `0x2D` `0x23` | 传感器读数、Reading Factors |
-| App | `0x48`-`0x4B` + payload type 1 | **SOL**（含 BREAK 与 ACK 流控）|
+| App | `0x48`-`0x4B` + payload type 1 | **SOL**（含双向 BREAK、ACK 流控）|
 | RMCP class 6 | ASF presence ping → pong | 部分客户端握手前置 |
+
+加密同时支持 **cipher suite 3**（HMAC-SHA1）和 **suite 17**（HMAC-SHA256），
+两个客户端都不需要额外参数。
 
 电源命令映射到 `ubmc_sys_ctrl.sh -q/-f/-o/-c/-r/-s`；SEL 读的是厂商格式
 `/var/log/sel`（20 字节 × 200 槽循环缓冲）；传感器走 hwmon（`peci_cputemp`、
@@ -253,9 +257,8 @@ GET /ws   : 101（SOL 与 Web Console 并存）
 完整协议细节、踩坑与已知缺口见 [ipmi-lan.md](./ipmi-lan.md) 和
 [sol-design.md](./sol-design.md)。
 
-**还没实现**（都不影响日常运维）：LAN configuration parameters（`lan print` 能跑但
-值是 `not supported`）、SHA-256 cipher suite（python-ipmi 需加 `-o cipher=3`）、
-主机→客户端方向的 BREAK 通知、Set LAN Config / User Access / IPMB 桥接 / PEF。
+**还没实现**（都不影响日常运维）：Set LAN Configuration Parameters（读全部实现了，
+`lan set` 返回 `0xC1`）、Set/Get User Access、IPMB 桥接、PEF、SDR 设备端写入。
 
 ## 建议的使用方式
 

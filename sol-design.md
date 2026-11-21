@@ -287,8 +287,15 @@ con.close()
 > 控制台的固有行为，真实 BMC 一样，但也意味着**误发 BREAK 后随手按键可能触发 `b` 重启
 > 或 `c` crash**。所以只在客户端明确请求时才发。
 
-反方向（主机发出 BREAK → 通知客户端，`payload[3] & 0x04`）没有实现：需要在读
-`console_manager_socket` 时识别 BREAK 条件，而那个 socket 已经把线路事件抹掉了。
+反方向（主机发出 BREAK → 通知客户端，`payload[3] & 0x04`）也已经实现：主机发 BREAK 时
+console socket 的字节流里什么都没有（tty 层把线路事件吞掉了），但驱动给每个端口维护的
+错误计数器还在，所以只打开 `/dev/ttyS1` 而不读它、每 500 ms 用 `TIOCGICOUNT` 比对
+`icount.brk`，涨了就在下一包 SOL 的 `payload[3]` 上置 `0x04`；没有字符数据可捎带时单发一个
+纯头包把标志带出去。实测客户端收到 `flags=04` 且只带一次。
+
+（主机当前没跑系统，无法让它主动发 BREAK，所以上报路径是用一个"基线故意错开 1"的临时
+构建验证的，确认后立刻换回正式二进制。检测本身由 `scripts/ipmi-lan/brkcount.c` 探针确认
+可用：`brk=0 frame=0 overrun=0 rx=33256`。）
 
 ### 8.2 ACK 滑动窗口
 

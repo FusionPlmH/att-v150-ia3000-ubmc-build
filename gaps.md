@@ -1,7 +1,7 @@
-# 还缺什么（2026-11-21 第七轮后，实测数据）
+# 还缺什么（2026-11-21 第九轮后，实测数据）
 
-基线：`ubmc-bank1/rootfs.cpio.uboot` 第七轮版
-（54,340,651 B / `650ec5a1…`），对比对象是出厂 1.2.0.8。
+基线：`ubmc-bank1/rootfs.cpio.uboot` 第九轮版
+（54,337,296 B / `ccb850bf…`），对比对象是出厂 1.2.0.8。
 
 结论先行：
 
@@ -170,11 +170,11 @@ ss -uln   -> 只有 0.0.0.0:68（DHCP client），没有 623/udp
 
 仍缺（都不影响日常运维）：
 
-- **LAN configuration parameters**（Transport 0x0C 0x02）—— `ipmitool lan print` 能跑通，
-  但 IP/掩码/网关会显示 `not supported`。要做需要 `recvmsg` + `IP_PKTINFO` 拿目的地址。
-- **SHA-256 cipher suite（17/18/19）** —— python-ipmi 默认挑 17，会被拒；加 `-o cipher=3` 即可。
-- **主机 → 客户端的 BREAK 通知**（`payload[3] & 0x04`）—— console socket 把线路事件抹掉了。
+- **Set LAN Configuration Parameters**（Transport 0x0C 0x01）—— 读全部实现了
+  （`ipmitool lan print` 出真实 IP/掩码/MAC/网关），写没做，`lan set` 返回 `0xC1`。
 - Set LAN Config / Get-Set User Access / IPMB 桥接 / PEF / SDR 写入。
+
+第九轮已经把 SHA-256 cipher suite（17/18/19）、主机→客户端 BREAK 通知补齐了。
 
 ## 五、组件版本陈旧（不是缺，但要知道）
 
