@@ -81,7 +81,26 @@ IPMI 响应数据 = `[cmd][completion code][data...]`。原来所有 handler 都
 pyghmi 在 `session.py:1461` 用 `sid != self.localsid` 校验响应，写 `rm_id` 会被静默丢弃。
 RAKP2/RAKP4 的 payload 里也要回 `rc_id`。
 
+### 5. `daemon &` 会挂死 uhttpd（如果调用者拥有管道）
+
+在 Web RPC 的 CGI 里跑 `/etc/init.d/S47is_ipmi_lan start`，如果脚本内部用
+`daemon &` 起进程，子进程会**继承 CGI 的 stdout 写端**。uhttpd 要等到管道 EOF
+才结束请求，于是永远等下去 —— 表现是「Web UI 整个挂掉」，而且只能重启恢复。
+
+shell 侧的 `supervise > /dev/null 2>&1 < /dev/null &` 在 busybox ash 下**并不可靠**。
+正确做法是让守护进程自己 detach：
+
+```c
+if (argc > 1 && strcmp(argv[1], "-d") == 0)
+    daemonize();      /* fork / setsid / chdir / freopen stderr -> LOG_FILE */
+```
+
+init 脚本因此只写 `"$DAEMON" -d`，同步返回；日志由守护进程自己 `freopen` 到
+`/var/log/ipmi-lan.log`，完全不依赖调用者的重定向。
+
 ## 另一个客户端兼容性坑
+
+
 
 pyghmi 判断"对端支持 IPMI 2.0"用的是：
 

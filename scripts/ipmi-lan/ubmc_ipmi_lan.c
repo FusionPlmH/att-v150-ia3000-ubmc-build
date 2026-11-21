@@ -53,6 +53,7 @@
 #define AUTHCODE_LEN     12          /* HMAC-SHA1 truncated to 96 bit */
 #define MAX_USERS        16
 #define PASSWD_FILE      "/config/ipmi-lan.passwd"
+#define LOG_FILE         "/var/log/ipmi-lan.log"
 
 #define PT_IPMI          0x00
 #define PT_OPEN_REQ      0x10
@@ -888,6 +889,40 @@ static volatile sig_atomic_t g_stop;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 /*
+ * -d detaches properly: fork/setsid/close fds and reattach stderr to the log.
+ * Without it, a caller that owns a pipe (the uhttpd CGI behind the web RPC)
+ * would block forever waiting for EOF, because a plain `daemon &` inherits the
+ * pipe's write end.
+ */
+static void daemonize(void)
+{
+    pid_t pid = fork();
+    FILE *log;
+
+    if (pid < 0) {
+        logmsg("fork: %s", strerror(errno));
+        exit(1);
+    }
+    if (pid > 0)
+        exit(0);
+
+    setsid();
+    if (chdir("/") != 0) {
+        /* not fatal */
+    }
+    if (freopen("/dev/null", "r", stdin) == NULL) {
+        /* not fatal */
+    }
+    log = freopen(LOG_FILE, "a", stderr);
+    if (log == NULL) {
+        if (freopen("/dev/null", "w", stderr) == NULL) {
+            /* not fatal */
+        }
+    }
+    dup2(fileno(stderr), fileno(stdout));
+}
+
+/*
  * A packet that arrives on an interface enslaved to a VRF is only delivered
  * to listeners bound to that VRF, because is_mgmtd leaves
  * net.ipv4.udp_l3mdev_accept at 0.  "ip vrf exec" cannot give us that binding
@@ -938,7 +973,8 @@ int main(int argc, char **argv)
     char *p;
 
     if (argc > 1 && strcmp(argv[1], "-h") == 0) {
-        printf("usage: %s [-h]\n", argv[0]);
+        printf("usage: %s [-d] [-h]\n", argv[0]);
+        printf("  -d                              detach and log to %s\n", LOG_FILE);
         printf("  listens on udp/%d, users from %s\n", IPMI_PORT, PASSWD_FILE);
         printf("  IPMI_LAN_BIND=<dev>[,<dev>...]  interfaces to bind\n");
         printf("      empty (the default) = one wildcard listener on all ports\n");
@@ -952,6 +988,9 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGPIPE, SIG_IGN);
     srand((unsigned)(time(NULL) ^ getpid()));
+
+    if (argc > 1 && strcmp(argv[1], "-d") == 0)
+        daemonize();
 
     load_users();
     if (g_nusers == 0)

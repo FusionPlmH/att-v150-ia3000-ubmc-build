@@ -47,22 +47,18 @@ open_firewall() {
         || echo "ipmi-lan: could not open udp/623 (no vrf-pub yet)"
 }
 
-supervise() {
-    while [ ! -f "$STOPFLAG" ]; do
-        "$DAEMON" >> "$LOG" 2>&1
-        [ -f "$STOPFLAG" ] && break
-        sleep 5
-    done
-}
-
 start() {
     [ -x "$DAEMON" ] || { echo "ipmi-lan: $DAEMON missing"; return 1; }
-    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && return 0
+    if pidof ubmc_ipmi_lan > /dev/null 2>&1; then
+        return 0
+    fi
 
     ensure_passwd
-    rm -f "$STOPFLAG"
-    supervise &
-    echo $! > "$PIDFILE"
+    rm -f "$STOPFLAG" "$PIDFILE"
+
+    # -d makes the daemon fork/setsid and reattach stderr to $LOG itself, so
+    # nothing here inherits the caller's stdout (the web RPC would hang on it)
+    "$DAEMON" -d || { echo "ipmi-lan: failed to start"; return 1; }
 
     # give is_mgmtd its chance to finish the firewall first, then punch the hole
     i=0
@@ -71,16 +67,20 @@ start() {
         i=$((i + 1))
     done
     open_firewall
-    echo "ipmi-lan: listening on udp/623"
+    sleep 1
+    if pidof ubmc_ipmi_lan > /dev/null 2>&1; then
+        echo "ipmi-lan: listening on udp/623 (pid $(pidof ubmc_ipmi_lan))"
+    else
+        echo "ipmi-lan: NOT running, see $LOG"
+        return 1
+    fi
 }
 
 stop() {
     touch "$STOPFLAG"
     killall -q ubmc_ipmi_lan 2>/dev/null
-    if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null
-        rm -f "$PIDFILE"
-    fi
+    rm -f "$PIDFILE"
+    return 0
 }
 
 case "$1" in
