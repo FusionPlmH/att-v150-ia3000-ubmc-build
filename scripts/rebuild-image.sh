@@ -13,6 +13,8 @@
 # 用法： bash rebuild-image.sh [输出目录]
 set -e
 
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
 SRC_IMG=/root/uBMC-fork/buildroot/output/images/rootfs.cpio.uboot
 FACTORY=/root/factory-rootfs
 MGMTD_LIB=/root/libnew.so
@@ -498,6 +500,25 @@ print("    dispatcher 已打补丁")
 DISPATCH
 
 echo "    REST/Redfish 已接入"
+
+echo "=== 6.7 IPMI over LAN (RMCP+ / udp 623) ==="
+IPMI_DIR="$SCRIPT_DIR/ipmi-lan"
+HOSTBIN=/root/uBMC-fork/buildroot/output/host/bin
+SYSROOT=/root/uBMC-fork/buildroot/output/host/arm-buildroot-linux-gnueabihf/sysroot
+
+[ -f "$IPMI_DIR/ubmc_ipmi_lan.c" ] || { echo "!! 缺少 $IPMI_DIR/ubmc_ipmi_lan.c"; exit 1; }
+[ -f "$IPMI_DIR/S47is_ipmi_lan" ]   || { echo "!! 缺少 $IPMI_DIR/S47is_ipmi_lan"; exit 1; }
+[ -x "$HOSTBIN/arm-linux-gnueabihf-gcc" ] || { echo "!! 缺少交叉编译器"; exit 1; }
+
+"$HOSTBIN/arm-linux-gnueabihf-gcc" --sysroot="$SYSROOT" -O2 -Wall \
+    -o "$R/usr/sbin/ubmc_ipmi_lan" "$IPMI_DIR/ubmc_ipmi_lan.c" \
+    -L"$SYSROOT/usr/lib" -lcrypto
+"$HOSTBIN/arm-linux-gnueabihf-strip" "$R/usr/sbin/ubmc_ipmi_lan" 2>/dev/null || true
+chmod 755 "$R/usr/sbin/ubmc_ipmi_lan"
+echo "    ubmc_ipmi_lan $(stat -c%s "$R/usr/sbin/ubmc_ipmi_lan") 字节"
+
+install -m 755 "$IPMI_DIR/S47is_ipmi_lan" "$R/etc/init.d/S47is_ipmi_lan"
+echo "    /etc/init.d/S47is_ipmi_lan 已安装"
 
 echo "=== 7. 清理并打包 ==="
 # init.d 必须是普通名字，rcS 在运行时会自己改成 IS_*

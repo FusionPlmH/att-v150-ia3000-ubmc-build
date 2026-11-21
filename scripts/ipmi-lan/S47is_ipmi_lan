@@ -1,0 +1,98 @@
+#!/bin/sh
+#
+# ubmc_ipmi_lan -- IPMI 2.0 over LAN (RMCP+) listener on udp/623
+#
+# The stock firmware only exposes IPMI through the KCS interface shared with
+# the host, so ipmitool/Redfish clients have nothing to talk to on the network.
+# This service adds the LAN listener and maps chassis commands onto the vendor
+# tooling (/usr/sbin/ubmc_sys_ctrl.sh).
+#
+# Notes:
+#   * the daemon binds a wildcard udp/623 socket -- a socket bound to the
+#     vrf-pub device does NOT receive traffic that arrives on its slave (eth1),
+#     which is why the listener deliberately stays interface agnostic
+#   * is_mgmtd rebuilds the INPUT chain early in boot, so the udp/623 accept
+#     rule is inserted only after /tmp/mgmtd_started appears
+#   * credentials live in /config (persistent ext4) because RMCP+ derives its
+#     keys from the plaintext password and /etc/shadow cannot provide that
+
+DAEMON=/usr/sbin/ubmc_ipmi_lan
+PASSWD=/config/ipmi-lan.passwd
+LOG=/var/log/ipmi-lan.log
+STOPFLAG=/var/run/ipmi-lan.stop
+PIDFILE=/var/run/ipmi-lan.pid
+
+ensure_passwd() {
+    [ -f "$PASSWD" ] && return 0
+    umask 077
+    cat > "$PASSWD" <<'EOF'
+# IPMI over LAN credentials, one user:password per line.
+# Change this default before exposing the BMC on an untrusted network.
+root:51L1C0M201B
+EOF
+    chmod 600 "$PASSWD"
+    echo "ipmi-lan: seeded $PASSWD with the default password"
+}
+
+open_firewall() {
+    iptables -C INPUT -i vrf-pub -p udp --dport 623 -j ACCEPT 2>/dev/null && return 0
+    pos=$(iptables -S INPUT | grep -n -- '-i vrf-pub -j DROP' | head -1 | cut -d: -f1)
+    if [ -z "$pos" ]; then
+        pos=1
+    else
+        pos=$((pos - 1))
+        [ "$pos" -lt 1 ] && pos=1
+    fi
+    iptables -I INPUT "$pos" -i vrf-pub -p udp --dport 623 -j ACCEPT 2>/dev/null \
+        || echo "ipmi-lan: could not open udp/623 (no vrf-pub yet)"
+}
+
+supervise() {
+    while [ ! -f "$STOPFLAG" ]; do
+        "$DAEMON" >> "$LOG" 2>&1
+        [ -f "$STOPFLAG" ] && break
+        sleep 5
+    done
+}
+
+start() {
+    [ -x "$DAEMON" ] || { echo "ipmi-lan: $DAEMON missing"; return 1; }
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && return 0
+
+    ensure_passwd
+    rm -f "$STOPFLAG"
+    supervise &
+    echo $! > "$PIDFILE"
+
+    # give is_mgmtd its chance to finish the firewall first, then punch the hole
+    i=0
+    while [ ! -f /tmp/mgmtd_started ] && [ $i -lt 60 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    open_firewall
+    echo "ipmi-lan: listening on udp/623"
+}
+
+stop() {
+    touch "$STOPFLAG"
+    killall -q ubmc_ipmi_lan 2>/dev/null
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)
+        if pidof ubmc_ipmi_lan > /dev/null 2>&1; then
+            echo "ipmi-lan: running (pid $(pidof ubmc_ipmi_lan))"
+        else
+            echo "ipmi-lan: stopped"
+        fi
+        ;;
+    *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

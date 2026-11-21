@@ -21,7 +21,8 @@
 | BIOS 升级 / 备份 / 恢复 | ✅ | `/admin/bmc/bios` | `/action/bmc/bios/*` 端点 |
 | 系统事件日志 SEL | ✅ | `/admin/bmc/eventlog` | `/action/bmc/sel/clear`、`ubmc_ipmi_sel_prt` |
 | 硬件健康（风扇/温度/电压/电源） | ✅ | 无独立页面 | `/status/bmc/health/*` |
-| **IPMI over LAN**（`ipmitool -I lanplus`） | ❌ | — | 无 UDP 623 监听 |
+| **IPMI over LAN**（`ipmitool -I lanplus` / Redfish 客户端） | ✅ | 自建 `ubmc_ipmi_lan`（udp/623，RMCP+ suite 3） | pyghmi 实测会话建立 + `get_power` + `set_power` |
+| IPMI `sel list` / `sensor` / `fru` / `sol` | ❌ | — | 服务端只实现 Chassis + Device ID |
 
 ## 各功能的实际入口
 
@@ -208,24 +209,42 @@ peci（device tree 里有节点）           Intel CPU 侧通道
 `ubmc_ipmi` 里有 `ipmi_host_power_monitor_thread` / `ipmi_get_host_power_state`
 / `ubmc_ipmi_poll_gpio_events`，主机电源状态是它通过 GPIO 轮询出来的。
 
-它对接主机的是 `ubmc_ipmi_slave.ko`（KCS 侧接口），所以 **IPMI 目前只在
+它对接主机的是 `ubmc_ipmi_slave.ko`（KCS 侧接口），所以 **原厂 IPMI 只在
 主机内部可用**（主机 OS 里 `ipmitool` 能通），**网络上没有 IPMI**。
 
-## 仍然缺的：IPMI over LAN
+## IPMI over LAN：已补齐（自建服务端）
+
+原厂没有 udp/623 监听者，第五轮自己实现了：
 
 ```
-ss -uln   → 只有 0.0.0.0:68（DHCP client）
+usr/sbin/ubmc_ipmi_lan       IPMI 2.0 RMCP+ 服务端，cipher suite 3
+etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
+/config/ipmi-lan.passwd      独立口令表（不能用 /etc/shadow，见下）
 ```
 
-没有 623/udp，也没有 `ipmitool` 二进制。要做到 `ipmitool -I lanplus -H <bmc> -U admin -P xxx chassis power on`，
-需要额外实现：
+命令映射：
 
-- IPMI 2.0 RMCP+ 的 UDP 623 服务端（会话、认证、加密）
-- 把 NetFn Chassis / Sensor / SEL / FRU 命令映射到现有的
-  `ubmc_sys_ctrl.sh` 和 `/status/bmc/*`
+- NetFn Chassis `0x01` Get Chassis Status → `ubmc_sys_ctrl.sh -q`
+- NetFn Chassis `0x02` Chassis Control → `-f` / `-o` / `-c` / `-r` / `-s`
+- NetFn App `0x01` Get Device ID → 静态
+- 未识别的 netfn/cmd → `0xC1`（Invalid Command）
 
-这是一个独立工程量，不是配置问题。**但用户列的需求（看输出、发按键、
-开关机重启、挂 ISO）都不依赖它** —— Web UI 已经全覆盖。
+口令为什么不能沿用 shadow：RAKP2/RAKP3 的认证码是**以明文口令为 HMAC 密钥**
+算的，单向哈希算不出来。真实 BMC 也都是单独存一份 IPMI 口令。
+
+实测（pyghmi）：
+
+```
+RMCP+ 会话建立（RAKP1-4）  通过
+get_power()                {'powerstate': 'on'}
+set_power('on')            已下发
+```
+
+完整协议细节与四个排查坑见 [ipmi-lan.md](./ipmi-lan.md)。
+
+**还没实现**：SEL（`ipmitool sel list`）、SDR 传感器（`ipmitool sensor`）、
+FRU（`ipmitool fru`）、SOL（`ipmitool sol activate`）、`chassis bootdev`。
+这些在 Web UI 侧都有对应能力，只是没桥接到 IPMI 协议。
 
 ## 建议的使用方式
 

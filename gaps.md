@@ -7,8 +7,8 @@
 
 - **库层面零缺失** —— 1,191 个 ELF 扫下来，未解析的 NEEDED **0 种**
 - **REST API / Redfish 已补齐**（第四轮，本机实测 200）
-- 真正的功能缺口只剩一个：**IPMI over LAN**
-- 其余 39 项全是厂商专用、死文件或冗余路径
+- **IPMI over LAN 已补齐**（第五轮，pyghmi 实测握手 + 电源控制全通）
+- 真正的功能缺口已经清零，其余 39 项全是厂商专用、死文件或冗余路径
 
 ## 一、接口层面（Web/CLI 的后端能力）
 
@@ -140,23 +140,28 @@ usr/lib64/sa/sa{1,2}, sadc            3 项   与 usr/lib/sa/ 重复（我们已
 批次一补的工具：valgrind 全套、`ntpq`、`ssh-copy-id`、`json2lua`/`lua2json`、
 `cjson.so`、SNMP SHA-2 MIB。
 
-## 四、新发现的真缺口：IPMI over LAN
+## 四、IPMI over LAN（第五轮已补齐）
 
-这不是「没移植」，而是**固件里根本没有**：
+原状态：**固件里根本没有**，不是「没移植」。
 
 ```
 ss -uln   -> 只有 0.0.0.0:68（DHCP client），没有 623/udp
 也没有 ipmitool 二进制
 ```
 
-现有 IPMI 是 **KCS-only**：`ubmc_ipmi` + `ubmc_ipmi_slave.ko`，
-只在主机 OS 内部可用。要支持 `ipmitool -I lanplus -H <bmc>`，需要
-自己实现 IPMI 2.0 RMCP+ 服务端（UDP 623、会话、认证、加密），
-再把 NetFn Chassis/Sensor/SEL/FRU 映射到现有的
-`ubmc_sys_ctrl.sh` 与 `/status/bmc/*`。
+现有 IPMI 是 **KCS-only**：`ubmc_ipmi` + `ubmc_ipmi_slave.ko`，只在主机 OS 内部可用。
 
-**但用户列的需求（看输出、发按键、开关机重启、挂 ISO）都不依赖它** ——
-Web UI 已经全覆盖，见 [ipmi-parity.md](./ipmi-parity.md)。
+第五轮自己实现了 IPMI 2.0 RMCP+ 服务端（`ubmc_ipmi_lan`，cipher suite 3），
+把 Chassis 命令映射到 `ubmc_sys_ctrl.sh`。真机用 pyghmi 实测：
+
+```
+RMCP+ 会话建立（RAKP1-4）          通过
+get_power()                        {'powerstate': 'on'}
+Get Device ID / Chassis Caps/Status code 0
+set_power('on')                    已下发
+```
+
+细节与踩坑见 [ipmi-lan.md](./ipmi-lan.md)。仍缺 SEL / SDR 传感器 / FRU / SOL / bootdev。
 
 ## 五、组件版本陈旧（不是缺，但要知道）
 
@@ -185,14 +190,15 @@ ABI 限制了上限：内核 4.14.54、glibc 2.27、Buildroot 2018.02（2019 EOL
 | 接口（插件） | 0 | ✅ 73 = 73 |
 | 接口（mgmtd 本体） | 3 | ⚪ 无人调用，无影响 |
 | REST API / Redfish | 0 | ✅ **第四轮补齐并实测** |
-| IPMI over LAN | — | 🟡 **唯一剩余的真缺口**，需自己实现 |
+| IPMI over LAN | 0 | ✅ **第五轮补齐并实测**（SEL/SDR/FRU/SOL 仍未实现） |
 | 厂商专用（CREANORD/phonehome/bmc-fan） | 22 文件 | ⚪ 本机用不到 |
 | 死文件 / 冗余 | 12 文件 | ⚪ 无引用 |
 
 ## 七、还不算「缺」但可以做的优化
 
 1. ~~**REST/Redfish 移植**~~ —— 已完成。
-2. **IPMI over LAN** —— 独立工程量，但做出来后 `ipmitool` 生态全通。
+2. ~~**IPMI over LAN**~~ —— 已完成（`ubmc_ipmi_lan` + `S47is_ipmi_lan`）。
+   继续往深做的话，下一个是 SEL / SDR 传感器桥接。
 3. **`S46is_web_fw` 上游化** —— 如果能改 mgmtd 源码，把 7681/80 的防火墙
    例外和 restapi/redfish 路由都交给它自己的模板生成，init 脚本就可以去掉。
 4. **杀掉冗余** —— 出厂遗留的 .35 库和 `usr/lib64/sa` 可以清掉，
