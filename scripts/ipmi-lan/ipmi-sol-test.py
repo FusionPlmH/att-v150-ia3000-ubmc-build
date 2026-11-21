@@ -1,4 +1,11 @@
-"""SOL (Serial Over LAN) acceptance test.
+"""SOL acceptance test through pyghmi's ``Console`` helper.
+
+NOTE: ``console.Console`` expects an interactive stdin and starts its login in a
+background thread, so it does not work in a scripted/non-tty run (the session
+context never advances).  Use it to drive SOL by hand; for CI-style checks use
+``ipmi-sol-raw-test.py``, which drives the same payloads through ``Command``.
+
+"""
 
 Activates an SOL payload through pyghmi's Console, reads the host console and
 sends keystrokes.  Also verifies that the web console path is unaffected: the
