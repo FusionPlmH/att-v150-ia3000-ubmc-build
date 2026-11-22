@@ -1,7 +1,14 @@
 # SOL（IPMI Serial Over LAN）实现方案
 
+[← 返回总览](README.md)
+
 **已实现并实测通过。** 不需要抢串口设备，只要连 `is_console_manager` 已有的分发
 socket 即可，与 Web Console **天然共存**。
+
+> 现状（第二十五轮）：`ubmc_ipmi_lan` 已是**静态链接**版本，装在
+> `/config/firmware/ubmc_ipmi_lan`（`/usr/sbin` 里那份重启会还原），
+> SOL 相关代码路径未变。客户端侧用 `ipmitool -I lanplus sol activate` 或
+> pyghmi 的 `Console` 都能用。
 
 实测（`scripts/ipmi-lan/ipmi-sol-raw-test.py`，一个只发不收、从不 ACK 的客户端）：
 
@@ -244,18 +251,18 @@ con.close()
 判定：能在 stdout 里看到 `USENEODDXTX0101USZZ01 login:` 和后续交互，
 且同一时间浏览器 Web Console 仍然可用（并行验证 fan-out）。
 
-## 六、工作量估计
+## 六、实现步骤（当时的工作量估计 —— **已全部完成**）
 
-| 步骤 | 内容 |
-|---|---|
-| 1 | 会话结构 + `sol_activate`/`sol_deactivate` + 4 个 NetFn case |
-| 2 | `sol_send_payload`/`sol_recv_payload`（复用现有 AES/HMAC 封装） |
-| 3 | 主循环接 console fd + 累积/超时逻辑 |
-| 4 | pyghmi `Console` 实测，按报错迭代序列号/ACK 细节 |
-| 5 | 写进 `rebuild-image.sh` 6.7 节、更新文档、出 v9 镜像 |
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 1 | 会话结构 + `sol_activate`/`sol_deactivate` + 4 个 NetFn case | ✅ |
+| 2 | `sol_send_payload`/`sol_recv_payload`（复用现有 AES/HMAC 封装） | ✅ |
+| 3 | 主循环接 console fd + 累积/超时逻辑 | ✅ |
+| 4 | pyghmi `Console` 实测，按报错迭代序列号/ACK 细节 | ✅（+ [8.2 节](#82-ack-滑动窗口)滑窗）|
+| 5 | 写进 `rebuild-image.sh` 6.7 节、更新文档、出 v9 镜像 | ✅（现在出到 v25）|
 
-第 4 步是主要不确定点（序列号/ACK 的边界情况），但协议格式已经从 pyghmi 源码
-逐字节确认，风险可控。
+第 4 步当时被判断为"主要不确定点"，实际踩到的坑确实都在这：
+序号回绕、以及"256 个未确认包之后必须等 ACK"（见 8.2）。
 
 ## 七、为什么不走"直接开 /dev/ttyS1"
 

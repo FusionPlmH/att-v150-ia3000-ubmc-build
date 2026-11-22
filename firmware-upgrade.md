@@ -143,16 +143,21 @@ is_upgrade_set_flag $software_upgrade_flag_addr "1"
 
 ## 手动把自编固件装进 bank 1
 
-前提：`/root/uBMC-fork/buildroot/output/images/` 里已有自己的 `zImage` 和 `rootfs.cpio.uboot`。
+> ⚠️ **前提正在消失**：`/root/uBMC-fork/buildroot/output/images/` 属于 **ramdisk**，
+> BMC 一重启就没了（`/` 是 `root=/dev/ram0`）。所以「编好的镜像」要么当场刷掉，
+> 要么先 `scp` 出来留底。工具链没了之后还能改镜像的办法见
+> [ipmi-lan.md](ipmi-lan.md) 的「没有 mkimage 时怎么出镜像」一节
+> （`scripts/ipmi-lan/repack-bank.sh` + `uimage-wrap.py`，在**已安装的镜像**上打补丁）。
+
+前提：手里有 `zImage` 和 `rootfs.cpio.uboot`（自编的，或别人的）。
 
 ```sh
-# ① 挂 bank1，先把原固件留底
+# ① 挂 bank1，先把原固件留底（p3 现在还剩多少空间自己看一眼）
 mkdir -p /mnt/p3 && mount /dev/mmcblk0p3 /mnt/p3
-mkdir -p /tmp/bank1-backup
-cp -a /mnt/p3/zImage /mnt/p3/rootfs.cpio.uboot \
-      /mnt/p3/dt.dtb /mnt/p3/software_version.txt /tmp/bank1-backup/
+mkdir -p /var/images/bank1-backup && cp -a /mnt/p3/zImage /mnt/p3/rootfs.cpio.uboot \
+      /mnt/p3/dt.dtb /mnt/p3/software_version.txt /var/images/bank1-backup/
 
-# ② 先写临时名
+# ② 先写临时名（运行中的文件不能直接覆盖）
 cp /tmp/up/zImage             /mnt/p3/zImage.new
 cp /tmp/up/rootfs.cpio.uboot  /mnt/p3/rootfs.cpio.uboot.new
 sync
@@ -161,7 +166,7 @@ sha256sum /mnt/p3/zImage.new /mnt/p3/rootfs.cpio.uboot.new   # 必须与源一�
 # ③ 校验通过才替换
 mv /mnt/p3/zImage.new            /mnt/p3/zImage
 mv /mnt/p3/rootfs.cpio.uboot.new /mnt/p3/rootfs.cpio.uboot
-printf '##UBMC_1.2.0.8_BUILD_local##\n' > /mnt/p3/software_version.txt
+printf '##UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c_v25##' > /mnt/p3/software_version.txt
 sync; umount /mnt/p3
 
 # ④ 置标志（官方 debug 通道，比 dd 干净）
@@ -172,15 +177,26 @@ is_upgrade.sh -s            # 期望 boot:1 upgrade:1
 
 然后重启。串口会看到 `Booting from bank 1`。
 
-**版本号格式要求**：`software_version.txt` 必须以 `##` 开头结尾
+**版本号格式要求**：`software_version.txt` 必须以 `##` 开头结尾、**不要换行**
 （`is_upgrade.sh` 注释：`version must start with ## and end with ##`）。
 出厂值形如 `##UBMC_1.2.0.7_BUILD_202e3c40##`。
 
-新固件起来后确认落定：
+⚠️ **版本号有两处，别只改一处**：
+
+| 位置 | 谁看 |
+|---|---|
+| `/mnt/p3/software_version.txt` | `is_upgrade.sh` / 厂商升级工具 |
+| 镜像里的 `/etc/product/UBMC/version/{software,firmware}_version.txt` | Web UI 的 "Software/Firmware Version" |
+
+只改 p3 那份，Web 上仍然显示镜像里编进去的旧值 —— 第一版 `_v25` 就是这么错的，
+后来重打了镜像才对齐（见工作目录的 `ubmc-bank1/MANIFEST.txt`）。
+`rebuild-image.sh` 用 `FW_REV` 环境变量把同一个前缀写进这两个文件。
+
+新固件起来后确认落定（**实测就是这样**）：
 
 ```sh
-is_upgrade.sh -s                       # upgrade flag 应为 0
-# 若还是 2（说明没触发 check-upgrade），手动清：
+is_upgrade.sh -s                       # 起来后 upgrade flag 自己变回 0，boot 保持 1
+# 若还是 2（说明 check-upgrade 没跑完），手动清：
 is_upgrade.sh -t fw-upgrade -v 0
 ```
 
@@ -217,7 +233,9 @@ is_upgrade.sh -t fw-upgrade -v 0    # 只清 upgrade，保持 boot=1
 > 但 `boot1.scr` 里的 `console=ttyS0,115200n8` 会让内核日志正常输出，
 > 足以判断走到了哪一步。
 
-## 实测数据（ATT V150 出厂机）
+## 实测数据
+
+**出厂机（第一次上电时的状态）**
 
 ```
 boot flag  = '0'    upgrade flag = '0'
@@ -226,7 +244,7 @@ bank 1 (p3)  UBMC_1.2.0.7_BUILD_202e3c40
 uboot        UBMC_UBOOT_1.0.2_1d22f81a   Vendor: ATT
 ```
 
-| 文件 | bank 0 (p2) | bank 1 (p3) | 自编译 |
+| 文件 | bank 0 (p2) | bank 1 (p3) | 自编译第一版 |
 |---|---|---|---|
 | `zImage` | 4,211,200 `64a8b1f4` | 4,211,200 `491aad07` | 4,211,200 `7c98569e` |
 | `dt.dtb` | 33,014 `23c76bca` | 33,014 `23c76bca` | **`23c76bca` 相同** |
@@ -235,4 +253,35 @@ uboot        UBMC_UBOOT_1.0.2_1d22f81a   Vendor: ATT
 三个内核大小一致（同一份 4.14.54 源码），哈希不同只是构建时间不同；
 设备树三家逐字节相同。
 
-p3 分区 364 MiB，已用 57 MiB，可用 285 MiB —— 46 MB 的 rootfs 装得下。
+**现在（第二十五轮，跑在 bank 1 上）**
+
+```
+boot flag  = 1      upgrade flag = 0
+bank 0 (p2)  出厂 1.2.0.8                              ← 安全网，全程没动
+bank 1 (p3)  UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c_v25      ← 我们现在跑的
+             rootfs.cpio.uboot  55,823,961 B / `2e5efcec…`
+             zImage             4,211,200 B / `7c98569e…`   ← 自编译（同源码，不同哈希）
+             dt.dtb             33,014 B    / `23c76bca…`   ← 与出厂**逐字节相同**
+             + rootfs.cpio.uboot.v24   上一轮的备份（54,351,674 B）
+
+出厂 bank 0 对照：zImage 4,211,200 B / `64a8b1f4…`、dt.dtb 同 `23c76bca…`
+运行中的内核：4.14.54 #1 PREEMPT Tue Nov 17 09:19:28 UTC 2026  ← 我们自己编的那颗
+```
+
+`boot1.scr`（p1 里那个 328 B 的 U-Boot 脚本）实际做的是：
+
+```
+ext2load mmc ${mmcdev}:3 0x88000000 /dt.dtb
+ext2load mmc ${mmcdev}:3 0x82000000 /zImage
+ext2load mmc ${mmcdev}:3 0x88080000 /rootfs.cpio.uboot
+bootz 0x82000000 0x88080000 0x88000000
+```
+
+**三个文件全从 p3 读** —— 所以 bank 1 是"自带内核 + 自带 rootfs"的完整一套，
+换 bank 就是换整套（不是"只换 rootfs 沿用别人的内核"）。`boot0.scr` 一模一样，
+只是把 `:3` 换成 `:2`。
+
+分区实际大小（`/sys/class/block/*/size`）：p1 128 / p2 384 / p3 384 /
+p5 128（`/config`）/ p6 256（label `KEY`，空的）/ p7 1024（`/var/log`）/
+p8 5,148 MiB（`/var/images`）。
+p3 还剩 280+ MiB，55 MB 的镜像装得下 —— 这就是为什么「多刷几轮」没问题。

@@ -50,7 +50,7 @@ GitHub 代码搜索 `repo:silicom-ltd/uBMC phosphor` → **0 结果**。
 
 ### ④ IPMI 实现是自写的最小集
 
-如果是从 OpenBMC 改的，IPMI 应该是完整的 phosphor 栈。实测：
+如果是从 OpenBMC 改的，IPMI 应该是完整的 phosphor 栈。实测**原厂固件**：
 
 ```
 厂商 ID 0x030201            ← 「没申请厂商号」的占位值
@@ -58,11 +58,17 @@ GitHub 代码搜索 `repo:silicom-ltd/uBMC phosphor` → **0 结果**。
 GUID 01 02 03 … 10          ← 同样是占位
 实现 NetFn：App 0x01/0x08/0x2F/0x31/0x42/0x57、Storage 0x20-0x49、
             Transport 0x02、Group 0x2C/0x00
-未实现：Chassis 全部、S/E 全部、OEM 全部、App 0x43-0x49（用户管理）、
-        Set LAN、SOL
+原厂未实现：Chassis 全部、S/E 全部、OEM 全部、App 0x43-0x49（用户管理）、
+            Set LAN 的写、SOL
 ```
 
 真正基于 phosphor 的 BMC 不会缺 Chassis 和用户管理。
+
+> 上面这些缺的部分，本项目后来在 **LAN 侧**自己补了一个 IPMI 2.0 服务端
+> （`ubmc_ipmi_lan`），现在 chassis 控制 / 用户管理 / SOL / PEF 告警 / SDR 仓库
+> 都能用，`ipmitool -I lanplus` 直连即可。原厂那条 KCS/SSIF 通道本身没有改动。
+> 详见 [ipmi-lan.md](ipmi-lan.md)。
+
 详见 [ipmi-map.md](https://github.com/FusionPlmH/ia3000-ubmc-access-walkthrough/blob/main/ipmi-map.md)。
 
 ## 它到底是什么

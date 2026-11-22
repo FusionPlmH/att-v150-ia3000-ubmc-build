@@ -12,6 +12,28 @@
 
 修复：新增 `etc/init.d/S46is_web_fw`（已在设备上 A/B 验证通过）。
 
+### 现在（第二十五轮）的实际状态
+
+这已经不是"打了补丁的临时方案"了，权限规则**已经上游化进 mgmtd 配置库**：
+
+```sh
+# /config/is_mgmtd.conf —— 由 S44is_fw_conf 写入，mgmtd 自己下发
+/config/system/mgmt/iptables-rule/pub-console/rule,-I INPUT -i vrf-pub -p tcp --dport 7681 -j ACCEPT
+/config/system/mgmt/iptables-rule/pub-http/rule,-I INPUT -i vrf-pub -p tcp --dport 80 -j ACCEPT
+```
+
+`S46is_web_fw` 现在只负责三件 mgmtd 管不了的事：**hairpin 的 `DROP` 守卫**、
+`/etc/config/luci` 兜底、nginx 路由。设备上实查：
+
+```
+-A INPUT -i vrf-pub -p tcp -m tcp --dport 7681 -m mac ! --mac-source 9A:6A:89:51:95:9F -j DROP
+-A INPUT -i vrf-pub -p tcp -m tcp --dport 80   -j ACCEPT
+-A INPUT -i vrf-pub -p tcp -m tcp --dport 7681 -j ACCEPT
+```
+
+从局域网访问 `http://<bmc>/` 现在**立刻返回 301**（修之前是挂 6 秒超时），
+`nginx -t` 通过，`/config/is_mgmtd.conf` 的 sha1 门禁也通过。
+
 ## 症状
 
 Web UI → System > BMC > **Console (Shell)** 页面一直转圈，终端不出来。
@@ -346,8 +368,11 @@ Lua CGI），表现为整个 Web UI 无响应 8 秒以上。要用 `strings` 就
 
 ## 上游应该怎么修
 
-给 `is_mgmtd` 加一行：拉起 ttyd 之后用同一个模板给 7681 补例外，
-或者干脆把 ttyd 也纳入 `vrf-process-list` 的端口例外生成流程。
+归 mgmtd 管的那两条现在已经**上游化**了（写进 `is_mgmtd.conf` 的
+`iptables-rule/pub-console` 与 `pub-http`，见文首）。真正还留在 init 脚本里的
+只有 hairpin 守卫 —— 那本来就不是 mgmtd 的职责，而是"防止局域网绕过 nginx
+直连 ttyd"的自加约束。
 
-我们的 `S46is_ttyd_fw` 是在不碰闭源二进制前提下的等效做法。
-将来如果能改 mgmtd 源码，这段 init 脚本可以去掉。
+如果将来能改 mgmtd 源码，正确的修法是在拉起 ttyd 时用同一套模板自动生成
+7681 的例外，并把它纳入 `vrf-process-list` 的端口例外流程，
+这样连 `pub-console` 键都不用手工维护。

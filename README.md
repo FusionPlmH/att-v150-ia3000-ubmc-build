@@ -15,6 +15,21 @@
 > **只想要 IPMI over LAN / SOL / 告警？** 不用重编整个固件，直接看
 > [ipmi-lan.md](ipmi-lan.md)：里面的守护进程是静态链接的，丢到 `/config` 里就能升级。
 
+### 现在这台机器到哪儿了（第二十五轮）
+
+| 项 | 值 |
+|---|---|
+| 跑的镜像 | `rootfs.cpio.uboot` **55,823,961 B**，sha256 `2e5efcec…`，在 `/dev/mmcblk0p3`（bank 1）|
+| 版本横幅 | `##UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c_v25##`（见 `/etc/product/UBMC/version/`）|
+| U-Boot | **原厂没动**（p1 里 `MLO` 60,228 B / `u-boot.img` 435,668 B），`silent=1` 仍在 |
+| 内核 | 自编译的 4.14.54（同源码同配置，只有 1 个 `.ko` 与出厂不同），`dt.dtb` 与出厂 sha256 相同 |
+| IPMI over LAN | ✅ udp/623 可用，用户管理 / LAN 读写 / PEF+PET / SDR 仓库 / SOL 全通 |
+| Web | ✅ LuCI + `/rpc` + `/restapi` + `/redfish` + Web Console（7681）全通 |
+| 持久配置 | `/config`（`ipmi-lan.passwd`、`is_mgmtd.conf`、`firmware/ubmc_ipmi_lan`）|
+
+还差什么、为什么不做，见 [gaps.md](gaps.md)；逐轮变更见工作目录里的
+`ubmc-bank1/MANIFEST.txt`。
+
 **这个仓库里还有什么**（都在这份 README 的「详细文档」里有索引）：
 自建的 **IPMI 2.0 over LAN 服务端**（[ipmi-lan.md](ipmi-lan.md)、[sol-design.md](sol-design.md)）、
 REST/Redfish 移植、防火墙上游化、eMMC/出厂镜像差异分析、A/B 升级与救砖。
@@ -25,7 +40,7 @@ REST/Redfish 移植、防火墙上游化、eMMC/出厂镜像差异分析、A/B �
 | BMC DDR3 | 512 MB（K4B4G16） |
 | 启动介质 | Winbond SPI Flash（U47）+ 板载 eMMC |
 | 源码 | <https://github.com/silicom-ltd/uBMC> |
-| 出厂固件 | `UBMC_R102_20181205` |
+| 出厂固件 | `##UBMC_1.2.0.8_BUILD_1d22f81a##`（SPL banner 打的是 `UBMC_R102_20181205`）|
 | 串口 | `115200 8N1`，3.3V TTL，前面板 RJ45 console 口 |
 
 > ⚠️ **构建是安全的，刷写才是危险的。**
@@ -41,7 +56,7 @@ REST/Redfish 移植、防火墙上游化、eMMC/出厂镜像差异分析、A/B �
 | 文件 | 大小 | 说明 |
 |---|---|---|
 | `zImage` | ~4.2 MB | ARM 内核 |
-| `rootfs.cpio.uboot` | — | initramfs（正式启动用它，`root=/dev/ram0`） |
+| `rootfs.cpio.uboot` | 出厂 53,247,113 B / 现在 55,823,961 B | initramfs（正式启动用它，`root=/dev/ram0`） |
 | `rootfs.ext2` | — | 同一个 rootfs 的磁盘镜像 |
 | `rootfs.tar` | — | 打包形式（chroot 测试用这个） |
 | `dt.dtb` | ~32 KB | 设备树 |
@@ -115,7 +130,7 @@ sudo ./scripts/00-setup.sh
 ```
 
 `Debian` 必须是 **9.x** —— 用新发行版编出来的东西在 BMC 上跑不了
-（`GLIBC_2.28 not found`，BMC 上是 glibc 2.24）。
+（`GLIBC_2.28 not found` —— 镜像里是 glibc **2.21**，见 `/lib/libc-2.21.so`）。
 
 **失败**：`debootstrap` 装不上 → `apt install debootstrap`；
 源码路径不对 → `UBMC_SRC=/your/path sudo -E ./scripts/00-setup.sh`
@@ -257,19 +272,19 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 
 | 文件 | 内容 |
 |---|---|
-| [buildroot.md](buildroot.md) | **主构建**：Debian stretch chroot + Buildroot，含那个卡了很久的 `HOSTCFLAGS` bug |
-| [uboot.md](uboot.md) | U-Boot 单独构建：源码地址失效、11 个 vendor 补丁、3 个编译坑 |
-| [sdcard.md](sdcard.md) | SD 卡安装盘布局与写卡脚本；以及**为什么 SD 启动走不通** |
-| [chroot-and-recovery.md](chroot-and-recovery.md) | 在现跑 BMC 里 chroot 测试；串口救砖（`silent=1` 的真相） |
-| [firmware-upgrade.md](firmware-upgrade.md) | A/B 升级机制、两个裸偏移标志、`is_upgrade.sh -C` 的调用链与 `-c` 陷阱 |
-| [web-stack.md](web-stack.md) | 四套路由（sweb / rpc / restapi / redfish）与 RPC 提权洞 |
-| [webtty-diagnosis.md](webtty-diagnosis.md) | **Web Console 打不开的真正原因**：防火墙少了 7681/80 的例外 |
+| [buildroot.md](buildroot.md) | **主构建**：Debian stretch chroot + Buildroot，含那个卡了很久的 `HOSTCFLAGS` bug；以及**现在实际在用的静态交叉编译** |
+| [uboot.md](uboot.md) | U-Boot 单独构建：源码地址失效、11 个 vendor 补丁、3 个编译坑（**原厂 U-Boot 目前没动**）|
+| [sdcard.md](sdcard.md) | SD 卡安装盘布局与写卡脚本；以及**为什么 SD 启动走不通**（现在改用 `repack-bank.sh`）|
+| [chroot-and-recovery.md](chroot-and-recovery.md) | **三条改东西的路**；在现跑 BMC 里 chroot 测试；串口救砖（`silent=1` 的真相、**COM5 + `Ctrl+X`** 切 host/BMC 控制台）|
+| [firmware-upgrade.md](firmware-upgrade.md) | A/B 升级机制、两个裸偏移标志、`is_upgrade.sh -C` 的调用链与 `-c` 陷阱；**现在的 bank 状态**与 `repack-bank.sh` |
+| [web-stack.md](web-stack.md) | 四套路由（sweb / rpc / restapi / redfish）与 RPC 提权洞；为什么 nginx 路由上游化不了 |
+| [webtty-diagnosis.md](webtty-diagnosis.md) | **Web Console 打不开的真正原因**：防火墙少了 7681/80 的例外（现已上游化进 `is_mgmtd.conf`）|
 | [ipmi-parity.md](ipmi-parity.md) | **IPMI 级能力盘点**：控制台、电源、虚拟光驱、SEL、健康；IPMI over LAN 为自建服务端 |
 | [ipmi-lan.md](ipmi-lan.md) | **自建的 IPMI 2.0 / RMCP+ 服务端**：协议细节、用户管理、Set LAN、PEF/PET、SDR 仓库、踩过的坑与验收脚本 |
 | [sol-design.md](sol-design.md) | SOL 数据通路设计：BREAK、ACK 滑动窗口、与 Web Console 并存 |
-| [diff-vs-factory.md](diff-vs-factory.md) | 自编译镜像与出厂 1.2.0.8 的逐项差异 |
-| [dead-libs-audit.md](dead-libs-audit.md) | 「死文件」核查：34 个真孤儿 + 4 个 dlopen 插件 |
-| [gaps.md](gaps.md) | 剩余缺口的分类与判定依据 |
+| [diff-vs-factory.md](diff-vs-factory.md) | 自编译镜像与出厂 1.2.0.8 的逐项差异（**第二/四轮快照** + 现行数字对照）|
+| [dead-libs-audit.md](dead-libs-audit.md) | 「死文件」核查：34 个真孤儿 + 4 个 dlopen 插件（审计对象是出厂镜像）|
+| [gaps.md](gaps.md) | 剩余缺口的分类与判定依据（**第二十五轮后：IPMI 侧只剩 IPMB 一项不做**）|
 | [ubmc-lineage.md](ubmc-lineage.md) | 证明它不是 OpenBMC：Buildroot vs Yocto |
 
 ## 脚本
@@ -306,6 +321,12 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 ## 整条链路
 
 ```
+⓪ 只改守护进程   改 ubmc_ipmi_lan.c
+                  ↓  scripts/ipmi-lan/build-cross.sh   （WSL，静态交叉编译）
+   产出        prebuilt/ubmc_ipmi_lan                ← 日常用的是这条
+                  ↓  丢进 /config/firmware/ + S47 重启
+               （或 scripts/ipmi-lan/repack-bank.sh 直接打进已安装镜像）
+
 ① 环境        源码仓库 + Debian stretch chroot（gcc 6、glibc 2.24）
                   ↓  scripts/00-setup.sh
 ② Buildroot   编译 uBMC（u-boot + kernel + rootfs）
@@ -325,14 +346,15 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 
 改 rootfs 不等于改持久配置。BMC 上真正跨重启保留的只有：
 
-| 分区 | 挂载点 | 内容 |
-|---|---|---|
-| `mmcblk0p1` | — | FAT 启动分区（`MLO` / `u-boot.img` / `boot0.scr` / `zImage` …） |
-| `mmcblk0p2` | — | **bank 0** 的 rootfs（安全网，刷坏了 U-Boot 会自动回滚到它） |
-| `mmcblk0p3` | — | **bank 1** 的 rootfs（我们刷的那份）+ `software_version.txt` |
-| `mmcblk0p5` | `/config` | **mgmtd 配置库**（`is_mgmtd.conf` 等）：口令、网络、IPMI 用户与 PEF 都在这里 |
-| `mmcblk0p7` | `/var/log` | 日志（含厂商 SEL 文件 `/var/log/sel`） |
-| `mmcblk0p8` | `/var/images` | 4.9 G，**放工具、测试 rootfs、待刷镜像的地方** |
+| 分区 | 大小 | 挂载点 | 内容 |
+|---|---|---|---|
+| `mmcblk0p1` | 128 MiB | — | FAT16 启动分区（`MLO` / `u-boot.img` / `boot0.scr` / `boot1.scr` …）|
+| `mmcblk0p2` | 384 MiB | — | **bank 0** 的 rootfs（安全网，刷坏了 U-Boot 会自动回滚到它）|
+| `mmcblk0p3` | 384 MiB | — | **bank 1** 的 rootfs（我们刷的那份）+ `software_version.txt` |
+| `mmcblk0p5` | 128 MiB | `/config` | **mgmtd 配置库**：口令、网络、IPMI 用户/PEF/LAN 参数、`firmware/` 都在这里 |
+| `mmcblk0p6` | 256 MiB | — | ext4，label **`KEY`**，**空的**（只有 `lost+found`）—— 出厂预留 |
+| `mmcblk0p7` | 1 GiB | `/var/log` | 日志（含厂商 SEL 文件 `/var/log/sel`）|
+| `mmcblk0p8` | 5 GiB | `/var/images` | **放工具、测试 rootfs、待刷镜像的地方** |
 
 `/`（含 `/usr`、`/etc`）是 **ramdisk**（`root=/dev/ram0`），每次开机从 p2/p3 的镜像
 重建 —— 所以直接往 `/usr/sbin` 里丢东西重启就没了，要持久就得写进 `/config`

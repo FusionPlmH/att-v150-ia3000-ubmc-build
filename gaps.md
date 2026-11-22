@@ -1,16 +1,19 @@
-# 还缺什么（2026-11-21 第九轮后，实测数据）
+# 还缺什么（2026-11-22 第二十五轮后，实测数据）
 
-基线：`ubmc-bank1/rootfs.cpio.uboot` 第九轮版
-（54,337,296 B / `ccb850bf…`），对比对象是出厂 1.2.0.8。
+基线：`ubmc-bank1/rootfs.cpio.uboot` 第二十五轮版
+（55,823,961 B / `2e5efcec…`），对比对象是出厂 1.2.0.8。
 
 结论先行：
 
 - **库层面零缺失** —— 1,191 个 ELF 扫下来，未解析的 NEEDED **0 种**
-- **REST API / Redfish 已补齐**（第四轮，本机实测 200）
+- **REST API / Redfish 已补齐**（第四轮，本机实测 200 / 未认证 401）
 - **IPMI over LAN 已补齐**（第五~七轮）：RMCP+ 会话、电源控制、SEL、SDR/传感器、
   FRU、bootdev、SOL（含 BREAK 与 ACK 流控）全部实测通过，pyghmi 与 python-ipmi
   两个独立客户端交叉验证
-- 真正的功能缺口已经清零，其余 39 项全是厂商专用、死文件或冗余路径
+- **第二十五轮之后，IPMI 侧只剩一项「不做」**：IPMB 桥接（板上没有可桥对象，
+  `0x2C` 回 `0xC1` 就是标准应答）。用户管理、Set LAN 全参数、PEF + PET/syslog
+  发送器、SDR 仓库写入都已补齐
+- 其余 39 项全是厂商专用、死文件或冗余路径
 
 ## 一、接口层面（Web/CLI 的后端能力）
 
@@ -42,7 +45,7 @@
 
 全量清单对比：原厂 7,368 / 我们 7,331，缺 46 项。
 
-### ✅ A. REST API / Redfish —— 第四轮已补齐
+### ✅ A. REST API / Redfish —— 第四轮已补齐（第二十五轮实测 `/restapi/v1/status/system` → 200）
 
 原先缺 11 个文件，现在从出厂移植并接通：
 
@@ -171,7 +174,7 @@ ss -uln   -> 只有 0.0.0.0:68（DHCP client），没有 623/udp
 |---|---|---|
 | 会话 / 设备信息 | App 0x01/0x38/0x3B/0x3C/0x3D/0x42 | pyghmi、python-ipmi |
 | 电源控制 | Chassis 0x02/0x03 + 0x00/0x01 | pyghmi（`get_power` → `on`）|
-| SEL | Storage 0x40/0x42/0x43/0x47/0x48/0x49 | pyghmi 199 条、python-ipmi 2189 行 |
+| SEL | Storage 0x40/0x42/0x43/0x47/0x48/0x49 | pyghmi 约 190 条、python-ipmi 2189 行 |
 | SDR / 传感器 | Storage 0x20/0x21/0x22/0x23 + Sensor 0x2D/0x23 | pyghmi 24 个有值、python-ipmi 逐个列全 |
 | FRU | Storage 0x10/0x11 | pyghmi `get_inventory`、python-ipmi `fru print` |
 | boot options | Chassis 0x08/0x09 | pyghmi 读写往返 |

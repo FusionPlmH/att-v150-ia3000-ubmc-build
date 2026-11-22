@@ -4,7 +4,18 @@
 
 既然 SD 启动走不通（见 [sdcard.md](sdcard.md)），
 那"验证自己编的 rootfs"就用**在现跑 BMC 里 chroot**；
-万一玩坏了，用**串口盲发命令**救回来。
+万一玩坏了，用**串口**救回来。
+
+## 现在改东西的三条路（按风险从低到高）
+
+| 想改什么 | 怎么做 | 代价 |
+|---|---|---|
+| 只改 **IPMI 守护进程** | 静态二进制丢进 `/config/firmware/`，`/etc/init.d/S47is_ipmi_lan restart` | 几秒，不重启、不刷机，见 [ipmi-lan.md](ipmi-lan.md) |
+| 改 **整个 rootfs**（脚本、库、Web 栈） | chroot 里先验证（本文第一节）→ 满意了再刷 bank1（[firmware-upgrade.md](firmware-upgrade.md)） | 一次重启 |
+| 玩坏了 | ① 断电重上电让 U-Boot 回滚 bank 0 ② 串口（本文第二节） | 几分钟 |
+
+> ⚠️ 记住 `/` 是 **ramdisk**：往 `/usr`、`/etc` 里改的东西**重启就还原**。
+> 要么写进 `/config`，要么打进镜像。这一条踩过不止一次。
 
 ---
 
@@ -86,6 +97,19 @@ ssh root@<bmc> "mkdir -p /var/images/myroot && tar -C /var/images/myroot -xzf /v
 ---
 
 ## 二、串口救砖：`silent=1` 的真相
+
+> **先搞清一件事：前面板那个 RJ45 console 上其实有「两个」控制台。**
+>
+> 同一个串口（Windows 上枚举成 COM5 之类，`115200 8N1`）同时挂着
+> ① 主机（xz 那头）的 console，② uBMC 自己的 Linux console。
+> **在终端里按 `Ctrl+X` 可以在两者之间切换** —— 默认是主机控制台，
+> 切过去才会看到 BMC 的登录提示。BMC 侧用 `root` + 它的 Linux 口令登录
+> （出厂值见 [walkthrough 的「账号」一节](https://github.com/FusionPlmH/ia3000-ubmc-access-walkthrough#账号)）。
+>
+> 这一步是"失联之后最后的手段"：Web 挂了、SSH 挂了、IPMI 挂了，
+> 只要串口在，Ctrl+X 进 BMC 控制台就能改配置、重启服务。
+> 应急恢复具体做过一次（改 `ip link` 把 eth1 从 VRF 里摘掉导致 BMC 失联），
+> 就是靠它救回来的。
 
 一次失败的 `boot0.scr` 改动让机器"变砖"了 40 分钟，最后发现**根本没砖**。
 
@@ -195,13 +219,17 @@ if fatload mmc 1:1 0x81000000 /boot0.scr.orig; then fatwrite mmc 1:1 0x81000000 
 ## 四、串口工具
 
 这台机器没有显卡输出，所有操作都靠串口。
-用 [scripts/serial-console.ps1](scripts/serial-console.ps1)（自动探测串口，不用指定 COM 号）：
+用 [scripts/serial-console.ps1](scripts/serial-console.ps1)（自动探测串口，不用指定 COM 号；
+这台机上枚举成 **COM5**）：
 
 ```powershell
 .\serial-console.ps1 -Seconds 30                  # 抓启动输出
 .\serial-console.ps1 -Send "reset\r" -Seconds 20  # 给静默的 U-Boot 发 reset
 .\serial-console.ps1 -StripAnsi -Seconds 60       # 去 ANSI，日志好读
 ```
+
+> 想看的是 **uBMC 自己的控制台**（而不是主机）时，在这个串口终端里按一下 `Ctrl+X` 切换，
+> 然后按 `Enter` 出登录提示。
 
 另有 [scripts/press-setup-keys.ps1](scripts/press-setup-keys.ps1) ——
 在串口上轮换按固件 Setup 键（进 BIOS/固件菜单用）。
@@ -245,7 +273,8 @@ void board_late_init(void)          /* ← 第 509 行 */
 | **L3** | 只有 `U-Boot SPL ...` 之后卡住 | SPL | 串口确认 + 重刷 u-boot.img |
 | **L4** | 完全无输出 | 只有 ROM | SYSBOOT 硬件救援 |
 
-> 我们编的 U-Boot 已把 `silent=1` 改成 `silent=0`，所以 **L2 不会再出现**。
+> 我们编的 U-Boot 已把 `silent=1` 改成 `silent=0`，所以**刷了 SD 版 U-Boot 之后** L2 不会再出现。
+> 但**现在机器上跑的仍是原厂 U-Boot**（我们只刷了 bank1 的 rootfs），所以 L2 依然适用。
 
 ### 5.3 刷前必做：回读校验
 

@@ -2,6 +2,15 @@
 
 [← 返回总览](README.md)
 
+> **现状（第二十五轮）：机器上没有刷 U-Boot。**
+> `/dev/mmcblk0p1`（FAT，128 MiB）里还是**出厂**的引导件，实测：
+> `MLO` 60,228 B（sha256 `7fe8219e…`）、`u-boot.img` 435,668 B（sha256 `63ed4e20…`）、
+> `boot0.scr` 与 `boot0.scr.orig` 各 328 B。
+> 二十多轮改动全部落在 **bank 1 的 rootfs**（`/dev/mmcblk0p3`）里，
+> 所以本文关于"怎么编 U-Boot"的内容是**备用方案**，不是当前运行态。
+> 也就是说：**`silent=1` 仍然在生效**，串口静默时按
+> [chroot-and-recovery.md](chroot-and-recovery.md) 的 L2 处置。
+
 ---
 
 ## 为什么需要单独处理

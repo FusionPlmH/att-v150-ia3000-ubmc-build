@@ -22,7 +22,7 @@
 | 系统事件日志 SEL | ✅ | `/admin/bmc/eventlog` | `/action/bmc/sel/clear`、`ubmc_ipmi_sel_prt` |
 | 硬件健康（风扇/温度/电压/电源） | ✅ | 无独立页面 | `/status/bmc/health/*` |
 | **IPMI over LAN**（`ipmitool -I lanplus`） | ✅ | 自建 `ubmc_ipmi_lan`（udp/623，RMCP+ suite 3） | pyghmi + python-ipmi 双客户端实测 |
-| IPMI `sel list` / `sensor` / `fru` / `chassis bootdev` | ✅ | 同上 | 199 条 SEL、24 个传感器有值、完整 FRU、bootdev 读写往返 |
+| IPMI `sel list` / `sensor` / `fru` / `chassis bootdev` | ✅ | 同上 | ~190 条 SEL、24 个传感器有值、完整 FRU、bootdev 读写往返 |
 | IPMI `sol activate` | ✅ | 同上（复用 console fan-out socket） | 完整 1636 字节横幅 + login 提示；BREAK 与 ACK 流控实测 |
 
 ## 各功能的实际入口
@@ -218,7 +218,8 @@ peci（device tree 里有节点）           Intel CPU 侧通道
 原厂没有 udp/623 监听者，第五~七轮自己实现了完整的一套：
 
 ```
-usr/sbin/ubmc_ipmi_lan       IPMI 2.0 RMCP+ 服务端，cipher suite 3
+usr/sbin/ubmc_ipmi_lan       IPMI 2.0 RMCP+ 服务端，cipher suite 3 / 17，静态链接
+/config/firmware/ubmc_ipmi_lan  优先跑的那一份（ramdisk 根 fs，/usr 重启即还原）
 etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
 /config/ipmi-lan.passwd      独立口令表（不能用 /etc/shadow，见下）
 ```
@@ -228,10 +229,14 @@ etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
 | NetFn | 命令 | 能力 |
 |---|---|---|
 | App | `0x01` `0x38` `0x3B` `0x3C` `0x3D` `0x42` | 设备信息、通道能力、特权级、关会话、通道信息 |
-| Transport | `0x02` | LAN 参数（IP/掩码/MAC/网关/VLAN/cipher suites）|
+| App | `0x40` `0x41` `0x43`-`0x47` | **用户管理**：`user list` / `set name` / `set password` / `set privilege` / `enable` |
+| Transport | `0x02` | LAN 参数（IP/掩码/MAC/网关/VLAN/community/auth type/ARP 控制/cipher suites）|
 | Chassis | `0x00` `0x01` `0x02` `0x08` `0x09` | 能力/状态、电源控制、boot flags 与 bootdev |
 | Storage | `0x10` `0x11` | FRU（读 EEPROM TlvInfo，拼 Board + Product 区）|
 | Storage | `0x20`-`0x23` `0x40` `0x42` `0x43` `0x47`-`0x49` | SDR 仓库、SEL 读写/清空、SEL 时间 |
+| Storage | `0x24`-`0x2C` | **用户 SDR 仓库写入**：Add / Partial Add / Delete / Clear / Reserve |
+| PEF (0x04) | `0x10`-`0x15` | PEF 配置面（控制、策略表、策略号表、事件过滤器表）|
+| PEF (0x04) | `0x16` | **Alert Immediate**（发一条测试 PET）|
 | Sensor | `0x2D` `0x23` | 传感器读数、Reading Factors |
 | App | `0x48`-`0x4B` + payload type 1 | **SOL**（含双向 BREAK、ACK 流控）|
 | RMCP class 6 | ASF presence ping → pong | 部分客户端握手前置 |
@@ -242,6 +247,11 @@ etc/init.d/S47is_ipmi_lan    开机启动 + 守护重启 + 放行 udp/623
 电源命令映射到 `ubmc_sys_ctrl.sh -q/-f/-o/-c/-r/-s`；SEL 读的是厂商格式
 `/var/log/sel`（20 字节 × 200 槽循环缓冲）；传感器走 hwmon（`peci_cputemp`、
 `silc_fan`、`ads7830`）；FRU 读 i2c `0-0050` 的 ONIE TlvInfo EEPROM。
+
+> **`sel info` 显示 `Free Space: 0 bytes / Percent Used: 100%` 是正常的** ——
+> 厂商的 SEL 是**预分配**的定长槽文件（20 字节 × 200 槽），不是按需增长。
+> 槽用满后会回收最老的槽（这就是第二十五轮修"记录 ID 回绕导致客户端死循环"的来源）。
+> 判断"有没有新事件"要看 `Last Add Time`，不是看空闲空间。
 
 口令为什么不能沿用 shadow：RAKP2/RAKP3 的认证码是**以明文口令为 HMAC 密钥**
 算的，单向哈希算不出来。真实 BMC 也都是单独存一份 IPMI 口令。

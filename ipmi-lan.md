@@ -26,7 +26,7 @@
 | 子系统 | 来源 | 说明 |
 |---|---|---|
 | 温度/风扇/电压 | `/sys/class/hwmon/hwmonN` | 按 `name` 查找：`peci_cputemp.cpu0`（CPU 温度 13 通道）、`silc_fan`（4 风扇 + 3 板温）、`ads7830`（8 路 ADC）。实测 24 个通道有值 |
-| SEL | `/var/log/sel` | 持久分区 mmcblk0p7；厂商格式为 **20 字节/条 × 200 槽** 循环缓冲，读到有效记录（`[2]==0x02`）后转成标准 16 字节记录。实测 199 条 |
+| SEL | `/var/log/sel` | 持久分区 mmcblk0p7；厂商格式为 **20 字节/条 × 200 槽** 循环缓冲，读到有效记录（`[2]==0x02`）后转成标准 16 字节记录。实测约 190 条（槽用满后回收最老的）|
 | FRU | `/sys/bus/i2c/devices/0-0050/eeprom` | 256 字节 ONIE **TlvInfo** EEPROM（不是 IPMI FRU 格式），启动时转成 IPMI FRU 公共头 + Board + Product 三个区域 |
 | Boot flags | `/config/ipmi-boot-flags` | 两字节 `flags dev`（十六进制文本） |
 
@@ -192,7 +192,7 @@ Gratuitous ARP 只存储、不主动发（没有实现）。
 （对客户端来说 ID 就是槽的身份，同一个槽里只有最新那条算数）。这样
 ID 单调递增、最后一条的 next 是 `0xffff`，分页一定能结束。
 
-实测：`sel info` = 191 条、`sel list` = 191 行、`get_event_log()` = 191 条 / 1.2 秒，
+实测（第二十五轮）：`sel info` = `sel list` = `get_event_log()` 同一条数（当天 191 条，会随事件增减）／ 1.2 秒读完，
 三者一致（修复前分别是 197 / 192 / 不返回）。
 
 > 教训：**客户端卡死不一定怪客户端**。`ipmitool` 不按 ID 分页（它按序号读），
@@ -327,7 +327,7 @@ syslog 侧同时落盘：
 id:name:password:max-privilege:enabled
 1:root:<password>:4:1
 2:is_admin:<password>:4:1
-3:opuser:Op3ratorPw:3:1
+3:opuser:<password>:3:1
 ```
 
 老的 `name:password` 两字段格式仍然能读（自动分配 id、priv=4、enabled）。
@@ -412,7 +412,7 @@ id:name:password:max-privilege:enabled
 | `lan print` 的 Default Gateway 只读 `/proc/net/route` | 只看得见 main 表，管理口的路由在 VRF 表里 → 写了也读不回来 | 改读 `is_mgmtd.conf` 的 `default-gateway`，与写路径一致 |
 | Get Channel Cipher Suites（0x54）索引越界返回 `0xCC` | ipmitool 把它当失败，每条命令都先打一行 `Unable to Get Channel Cipher Suites` | 越界返回**空列表**（只有 channel 字节）；索引按"记录"而非字节计 |
 | 用户库写入不是原子的 | 写一半断电会把整个用户库写残 | 临时文件 + `fsync` + `rename` + `sync` |
-| 会话槽位没有空闲回收，满了就踢最老的 | 8 个僵尸会话就能把在线监控踢掉 | 加 300 s 空闲过期（SOL 占用的不回收）；`alloc_session()` 给新会话盖时间戳 |
+| 会话槽位没有空闲回收，满了就踢最老的 | 8 个僵尸会话就能把在线监控踢掉 | 加 60 s 空闲过期（SOL 占用的不回收）；`alloc_session()` 给新会话盖时间戳 |
 
 自查时还踩到一个自己引入的坑：空闲回收一开始把 `last == 0`（刚分配、还没收包）当成"最久空闲"，
 一秒内就把正在握手的会话删掉 —— 现象是客户端报 `Session no longer connected`。
@@ -420,8 +420,9 @@ id:name:password:max-privilege:enabled
 
 ### 已知限制（不是 bug，但要知道）
 
-- `MAX_SESSIONS = 8`；8 个都在用时，第 9 个会回收最久未活动的那个。
-- 会话空闲 300 s 后由 BMC 关闭（IPMI 允许）。长连接监控需要自己重连。
+- `MAX_SESSIONS = 16`；16 个都在用时，第 17 个会回收最久未活动的那个。
+- 会话空闲 **60 s** 后由 BMC 关闭（IPMI 允许；失败的握手也占槽，所以这个值不能太大）。
+  长连接监控需要自己重连。
 - 明文口令写在 `/config/ipmi-lan.passwd`（0600）—— RAKP 必须要明文，这是协议决定的。
 - `conf_set_line()` 按 512 字节行处理，`is_mgmtd.conf` 的行都远小于此。
 - pyghmi 的 `raw_command(netfn=1, ...)` 在客户端侧就失败（`Session no longer connected`），
@@ -549,7 +550,7 @@ FRU File ID 被当成 Asset Tag，再往后就越界崩在 `_decode_custom_field
 | 文件 | 用途 |
 |---|---|
 | **生产件** | |
-| `ubmc_ipmi_lan.c` | 守护进程（~4400 行，静态链接 libcrypto） |
+| `ubmc_ipmi_lan.c` | 守护进程（4,711 行，静态链接 libcrypto） |
 | `build-cross.sh` | WSL 里静态交叉编译并生成 `prebuilt/`（不依赖 buildroot 工具链） |
 | `S47is_ipmi_lan` | init 脚本（start/stop/restart/status，等 eth1 进了 VRF 再绑到 VRF 上启动；优先跑 `/config/firmware/ubmc_ipmi_lan`） |
 | `S44is_fw_conf` | 把 7681/80/623 的防火墙例外写进 `/config/is_mgmtd.conf`（必须早于 S45is_mgmtd）|
@@ -586,7 +587,12 @@ SIK            = HMAC-SHA1(password, Rc||Rm||role||userlen||user)
 
 `/etc/shadow` 里是单向哈希，**算不出**这些 MAC——真实 BMC 从来都是单独存一份 IPMI 口令。
 我们放在 `/config/ipmi-lan.passwd`（`/config` 是 mmcblk0p5 的持久 ext4，120 MB），
-格式 `user:password`，权限 0600。init 脚本首次启动会播种一个默认口令。
+每行 `id:name:password:max-privilege:enabled`（`#` 开头是注释），权限 0600。
+
+> **不写默认口令。** 首次启动时由 [scripts/ipmi-lan/S47is_ipmi_lan](scripts/ipmi-lan/S47is_ipmi_lan)
+> 从 `/dev/urandom` 生成一个随机口令写进去并打一行日志。
+> 早先的版本在源码里写死了一个固定口令，源码公开之后那等于所有机器的口令 —— 已经改掉。
+> 口令对不上时用 `ipmitool user set password <id> <pw>` 覆盖（第二十轮起支持）。
 
 ## 踩过的六个坑（都是从「客户端无响应」倒查出来的）
 
@@ -690,6 +696,7 @@ Web(443)/SSH(22) 还行、**IPMI 立刻 0/20** —— 证明 Web 那几个守护
 
 **结果**：刷入第十七轮之后重启，**开机 70 秒** IPMI 就能正常应答，
 不需要重启守护进程，也没有任何看门狗。
+（第二十五轮实测是 **56~79 s** 之间波动 —— 取决于 eMMC 上 cpio 解压到 ramdisk 的快慢。）
 
 ## 另一个客户端兼容性坑
 

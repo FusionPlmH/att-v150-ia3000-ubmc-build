@@ -157,3 +157,17 @@ SYSBOOT[4:0] = 0b11100          （busybox devmem 0x44E10040 → 0x0040031C）
 | **不追求真启动**：在现跑的 BMC 里 chroot 到自己的 rootfs 做功能测试 | **零风险**，见 [chroot-and-recovery.md](chroot-and-recovery.md) |
 
 实际选择的是第二条。对"验证我的改动对不对"这个目的，chroot 完全够用。
+
+---
+
+## 现状（第二十五轮）：安装盘这条路已经用不上了
+
+后来真正落地的更新方式是**给已安装的镜像打补丁**，连 SD 卡都不需要：
+
+```
+scripts/ipmi-lan/repack-bank.sh   在 BMC 上就地改 /mnt/p3 里的 rootfs.cpio.uboot
+scripts/ipmi-lan/uimage-wrap.py   重新封 U-Boot uImage 头（机器上没有 mkimage）
+```
+
+见 [firmware-upgrade.md](firmware-upgrade.md)。SD 安装盘只在"要拿回出厂状态"时才有意义，
+而这件事用 bank 0（p2）回滚更快（断电重上电即可）。

@@ -6,7 +6,7 @@
 
 ## 为什么用 Debian stretch chroot
 
-uBMC 是 2018 年的代码，要跑在 **glibc 2.24 / gcc 6** 那一代工具链上。
+uBMC 是 2018 年的代码，要跑在 **glibc 2.21 / gcc 6** 那一代工具链上。
 直接用现代的 WSL（Debian 12 / Ubuntu 24.04，gcc 12+、glibc 2.36+）编译，
 会遇到大量过时语法和 ABI 问题。
 
@@ -53,9 +53,13 @@ sudo ./scripts/00-setup.sh --recreate # 删掉重建（源码不动）
   源码可见        buildroot product ...
 ```
 
-`os` 必须是 9.x。用新发行版编出来的东西在 BMC 上跑不了
-（`GLIBC_2.28 not found` —— BMC 上是 glibc 2.24）。
+`os` 必须是 9.x。**在别处编出来的单个二进制拷进现成镜像会跑不了**
+（`GLIBC_2.28 not found` —— 镜像里是 glibc **2.21**，见 `/lib/libc-2.21.so`）。
 
+> 注意区分两件事：
+> **全量出镜像**（本文这条路）会连 glibc 一起换掉，所以 chroot 里的 glibc 版本只影响
+> "能不能编出 2018 年的代码"；
+> **往现成镜像里塞二进制**（[ipmi-lan.md](ipmi-lan.md) 那条路）才受镜像里 2.21 的限制。
 > 路径都在 [scripts/env.sh](scripts/env.sh) 里，复制成 `env.local.sh` 改就行。
 
 ---
@@ -177,7 +181,7 @@ grep -n 'HOSTCFLAGS' buildroot/linux/linux.mk   # 确认没了
 | 文件 | 大小 | 用途 |
 |---|---|---|
 | `zImage` | ~4.2 MB | ARM 内核 |
-| `rootfs.cpio.uboot` | — | **正式启动用这个**（initramfs，`root=/dev/ram0`） |
+| `rootfs.cpio.uboot` | 出厂 54,351,610 B / 现在 55,823,961 B | **正式启动用这个**（initramfs，`root=/dev/ram0`） |
 | `rootfs.ext2` | — | 同一 rootfs 的磁盘镜像 |
 | `rootfs.tar` | — | 打包形式 |
 | `dt.dtb` | ~32 KB | 设备树 |
@@ -196,6 +200,47 @@ console=ttyS0,115200n8 root=/dev/ram0 rw quiet loglevel=2
 - **改 `/etc` 下的东西不会持久** —— 重启就从 cpio 重建
 - **不能用 `ext4write` 改 `/etc/shadow`**（网上很多 ARM 设备教程这么干，这里不适用）
 - 要改持久配置，改 `/config`（mgmtd 的配置库，在 eMMC 上）
+- 要换镜像里的文件，写 `/config/firmware/` 让启动脚本优先跑它（IPMI 守护进程就是这么做的），
+  或者用 [scripts/ipmi-lan/repack-bank.sh](scripts/ipmi-lan/repack-bank.sh) 直接改已安装的镜像
+
+---
+
+## 第二十五轮起的实际做法：静态交叉编译
+
+日常改的其实只是 **`ipmi-lan/ubmc_ipmi_lan.c`** 这一个守护进程（约 4,660 行）。
+为它每次跑 20~40 分钟的 Buildroot 全量构建不现实，而且有两个硬约束：
+
+1. **BMC 上没有 buildroot 工具链，也没法常驻**。
+   `/` 是 ramdisk，往 `/root`、`/usr/local` 放的东西**重启就还原**；
+   那台机器也没有 gcc。
+2. **镜像里的 libc 是 2.21**（`/lib/libc-2.21.so`），
+   现代交叉编译器默认要 2.34+，直接拷进去会 `GLIBC_2.xx not found`。
+
+所以走 [scripts/ipmi-lan/build-cross.sh](scripts/ipmi-lan/build-cross.sh)：
+在 WSL 里用 `arm-linux-gnueabihf-gcc-13` + `libssl-dev:armhf` 的 `libcrypto.a`，
+**`-static`** 出一条 2.4 MB 的二进制 —— 不依赖目标机任何库，也不需要在机器上留工具链。
+
+```sh
+# WSL（Ubuntu 24.04）准备一次
+dpkg --add-architecture armhf
+apt install gcc-arm-linux-gnueabihf libssl-dev:armhf
+
+# 编译
+wsl -u root -e bash /mnt/c/.../ubmc-build/scripts/ipmi-lan/build-cross.sh
+# → prebuilt/ubmc_ipmi_lan  (2,488,892 B, stripped)  + .gz
+```
+
+产物在 `prebuilt/`，[scripts/rebuild-image.sh](scripts/rebuild-image.sh) **优先用它**
+（不去翻 buildroot 的输出）。部署方式见 [ipmi-lan.md](ipmi-lan.md)。
+
+### 什么时候必须回到 Buildroot 全量
+
+| 改了 | 要走哪条 |
+|---|---|
+| `ubmc_ipmi_lan.c`、`S47is_ipmi_lan`、`S44is_fw_conf` | 静态交叉编译 + 塞进 `/config`，或 `repack-bank.sh` 打进镜像 |
+| init 脚本、库、Web 栈（nginx / luci / uhttpd）、`/etc` 里的东西 | Buildroot 全量（本文） |
+| U-Boot / 内核 / 设备树 | Buildroot 全量 + [uboot.md](uboot.md) |
+| 要出 `rootfs.ext2` / SD 安装盘 | Buildroot 全量 + [sdcard.md](sdcard.md) |
 
 ---
 
