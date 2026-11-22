@@ -325,8 +325,8 @@ syslog 侧同时落盘：
 ```
 # 注释行以 # 开头
 id:name:password:max-privilege:enabled
-1:root:51L1C0M201B:4:1
-2:is_admin:51L1C0M201B:4:1
+1:root:<password>:4:1
+2:is_admin:<password>:4:1
 3:opuser:Op3ratorPw:3:1
 ```
 
@@ -708,34 +708,45 @@ ipmitool 不看这一位，置上无害。
 
 ## 验证
 
+仓库里**不写死主机和口令**（这是一个公开仓库）。脚本都从环境变量或命令行参数取：
+
 ```powershell
-# 裸探活（不依赖任何 IPMI 库）
-python ubmc-build\scripts\ipmi-lan\probe623.py 192.168.31.72
+$env:IPMI_HOST = "<bmc>"        # 所有脚本共用
+$env:IPMI_USER = "root"          # 默认就是 root，可以不给
+$env:IPMI_PASS = "<password>"    # 没有默认值，缺了脚本直接报 usage
+$env:TRAP_HOST = "<本机IP>"       # 只有 pet_community_test.py 用
+
+# 裸探活（不依赖任何 IPMI 库，不需要口令）
+python ubmc-build\scripts\ipmi-lan\probe623.py
 
 # 完整验收（安装 pyghmi： pip install pyghmi）
-python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py 192.168.31.72 root 51L1C0M201B
-python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py 192.168.31.72 root 51L1C0M201B --power-on
+python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py
+python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py --power-on
 
 # LAN 次要参数读写回环（auth / community / ARP / VLAN）
-python ubmc-build\scripts\ipmi-lan\lanparam_test.py 192.168.31.72
+python ubmc-build\scripts\ipmi-lan\lanparam_test.py
 
 # LAN 参数跨重启持久化：write -> 重启守护进程 -> read -> restore
-python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 write
-python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 read
-python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 restore
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py write
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py read
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py restore
 
 # SDR 仓库写入（add / partial add / delete / clear）+ LAN 参数
-python ubmc-build\scripts\ipmi-lan\sdr_lan_test.py 192.168.31.72
+python ubmc-build\scripts\ipmi-lan\sdr_lan_test.py
 
 # PET 里用的 community 是否就是配置的那条
-python ubmc-build\scripts\ipmi-lan\pet_community_test.py 192.168.31.72 <本机IP>
+python ubmc-build\scripts\ipmi-lan\pet_community_test.py
 ```
+
+主机也可以照旧放在第一个参数上（`sdr_lan_test.py <bmc>`），口令只走环境变量。
+守护进程第一次启动时**自己生成**一个随机口令并写进 `/config/ipmi-lan.passwd`
+（同时打一行日志），所以镜像里没有任何默认口令。
 
 `ipmitool` 一侧的等价验收（WSL 里跑，注意 `ip route add 192.168.31.0/24 via …`
 否则包根本发不出去）：
 
 ```sh
-B="-H 192.168.31.72 -U root -P 51L1C0M201B -I lanplus -C 3"
+B="-H <bmc> -U root -P <password> -I lanplus -C 3"
 ipmitool $B mc info; ipmitool $B lan print 1; ipmitool $B sdr info
 ipmitool $B sdr list; ipmitool $B fru; ipmitool $B user list 1; ipmitool $B sel list
 ```

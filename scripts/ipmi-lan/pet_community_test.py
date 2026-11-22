@@ -3,15 +3,19 @@
 Run: python pet_community_test.py [bmc-ip] [trap-host]
 """
 import subprocess
+import os
 import sys
 import time
 
 from pyghmi.ipmi import command
 
-BMC = sys.argv[1] if len(sys.argv) > 1 else "192.168.31.72"
-TRAP_HOST = sys.argv[2] if len(sys.argv) > 2 else "192.168.31.52"
-USER = "root"
-PASS = "51L1C0M201B"
+BMC = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("IPMI_HOST", "")
+TRAP_HOST = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("TRAP_HOST", "")
+USER = os.environ.get("IPMI_USER", "root")
+PASS = os.environ.get("IPMI_PASS", "")
+if not TRAP_HOST:
+    sys.exit("usage: %s <bmc> <trap-host>   (or set IPMI_HOST / TRAP_HOST)"
+             % os.path.basename(sys.argv[0]))
 COMMUNITY = b"v150pet"
 
 

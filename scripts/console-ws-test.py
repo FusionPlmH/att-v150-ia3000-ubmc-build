@@ -8,7 +8,7 @@ import struct
 import sys
 import time
 
-HOST = "192.168.31.72"
+HOST = os.environ.get("IPMI_HOST", "")
 PORT = 443
 TOKEN = sys.argv[1] if len(sys.argv) > 1 else "E2ETOKEN1234"
 

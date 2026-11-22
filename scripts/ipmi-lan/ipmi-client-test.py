@@ -6,15 +6,20 @@ status/control, and Device ID.
 
 usage: ipmi-client-test.py [host] [user] [password] [--power-on] [--trace]
 """
+import os
 import sys
 import traceback
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 FLAGS = {a for a in sys.argv[1:] if a.startswith("--")}
 
-HOST = args[0] if len(args) > 0 else "192.168.31.72"
-USER = args[1] if len(args) > 1 else "root"
-PASSWORD = args[2] if len(args) > 2 else "51L1C0M201B"
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+HOST = args[0] if len(args) > 0 else os.environ.get("IPMI_HOST", "")
+USER = args[1] if len(args) > 1 else os.environ.get("IPMI_USER", "root")
+PASSWORD = args[2] if len(args) > 2 else os.environ.get("IPMI_PASS", "")
+if not HOST or not PASSWORD:
+    sys.exit("usage: %s <bmc> <user> <password>   (or set IPMI_HOST / IPMI_PASS)"
+             % os.path.basename(sys.argv[0]))
 
 FAILS = []
 

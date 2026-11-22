@@ -2,13 +2,17 @@
 
 Run: python lanparam_test.py [bmc-ip]
 """
+import os
 import sys
 
 from pyghmi.ipmi import command
 
-BMC = sys.argv[1] if len(sys.argv) > 1 else "192.168.31.72"
-USER = "root"
-PASS = "51L1C0M201B"
+BMC = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("IPMI_HOST", "")
+USER = os.environ.get("IPMI_USER", "root")
+PASS = os.environ.get("IPMI_PASS", "")
+if not BMC or not PASS:
+    sys.exit("usage: %s <bmc> [args]   (or set IPMI_HOST / IPMI_PASS)"
+             % os.path.basename(sys.argv[0]))
 
 NAMES = {
     0: "set-in-progress",

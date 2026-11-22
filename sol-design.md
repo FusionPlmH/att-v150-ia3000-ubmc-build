@@ -232,7 +232,7 @@ case PT_SOL: handle_sol(fd, to, pkt, len); break;   /* 0x01 */
 ```python
 from pyghmi.ipmi import console
 import time
-con = console.Console(bmc="192.168.31.72", userid="root", password="51L1C0M201B")
+con = console.Console(bmc="<bmc>", userid="root", password="<ipmi-password>")
 time.sleep(2)                       # 应该看到主机 login 提示符
 con.send_keys("\r")                 # 回车 → 主机回吐横幅
 time.sleep(2)

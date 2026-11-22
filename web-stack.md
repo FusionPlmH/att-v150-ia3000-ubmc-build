@@ -275,4 +275,4 @@ GET /redfish/v1/Manager         认证后 -> 200，含真实 Datetime
 GET /redfish/v1/Chassis/Members/0/Power -> 200
 ```
 
-认证：`curl -k -u is_admin:51L1C0M201B https://<bmc>/redfish/v1`
+认证：`curl -k -u is_admin:<password> https://<bmc>/redfish/v1`

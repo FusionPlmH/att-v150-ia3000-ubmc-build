@@ -87,7 +87,7 @@ GET /redfish/v1/Manager         认证后 -> 200（含真实时间）
 GET /redfish/v1/Chassis/Members/0/Power -> 200
 ```
 
-认证用 HTTP Basic + PAM 账号（`is_admin` / `51L1C0M201B`）。
+认证用 HTTP Basic + PAM 账号（`is_admin` / 它的 Web 口令）。
 
 ### ⚪ B. 厂商专用（不影响本机，22 个文件）
 

@@ -75,7 +75,7 @@ M 版里两条关键配置（也是"默认口令"的来源）：
 
 ```ini
 BR2_TARGET_ENABLE_ROOT_LOGIN=y
-BR2_TARGET_GENERIC_ROOT_PASSWD="51L1C0M201B"
+BR2_TARGET_GENERIC_ROOT_PASSWD="<pick-one>"
 ```
 
 > **`root` 的口令就是在这里写死的。** AT&T 出厂固件只改了 `is_admin`，

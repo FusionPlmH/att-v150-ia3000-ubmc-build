@@ -4,10 +4,11 @@ usage: poll623.py <host> [max-seconds] [interval-seconds]
 Exits 0 on first reply, 1 if the budget runs out.
 """
 import socket
+import os
 import sys
 import time
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.31.72"
+HOST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("IPMI_HOST", "")
 BUDGET = float(sys.argv[2]) if len(sys.argv) > 2 else 900
 INTERVAL = float(sys.argv[3]) if len(sys.argv) > 3 else 10
 

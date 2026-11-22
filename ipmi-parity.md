@@ -157,7 +157,7 @@ Web 登录校验读的是 **`/etc/shadow`**（不是插件里内嵌的哈希）�
 生成哈希（任意 Linux）：
 
 ```sh
-python3 -c "import crypt; print(crypt.crypt('51L1C0M201B','\$6\$v150adm\$'))"
+python3 -c "import crypt; print(crypt.crypt('<password>','\$6\$v150adm\$'))"
 ```
 
 替换时要避开 shell 展开（`$6$...` 会被吃掉），用 awk 整行替换：

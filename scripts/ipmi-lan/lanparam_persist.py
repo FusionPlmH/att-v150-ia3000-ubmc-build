@@ -3,14 +3,25 @@
 Run: python lanparam_persist.py [bmc-ip]
 The caller must restart the daemon between the two phases (--phase write|read).
 """
+import os
 import sys
 
 from pyghmi.ipmi import command
 
-BMC = sys.argv[1] if len(sys.argv) > 1 else "192.168.31.72"
-PHASE = sys.argv[2] if len(sys.argv) > 2 else "write"
-USER = "root"
-PASS = "51L1C0M201B"
+_args = sys.argv[1:]
+_PHASES = ("write", "read", "restore")
+# accept both "lanparam_persist.py <bmc> <phase>" and "IPMI_HOST=... lanparam_persist.py <phase>"
+if _args and _args[0] in _PHASES:
+    BMC = os.environ.get("IPMI_HOST", "")
+    PHASE = _args[0]
+else:
+    BMC = _args[0] if len(_args) > 0 else os.environ.get("IPMI_HOST", "")
+    PHASE = _args[1] if len(_args) > 1 else "write"
+USER = os.environ.get("IPMI_USER", "root")
+PASS = os.environ.get("IPMI_PASS", "")
+if not BMC or not PASS:
+    sys.exit("usage: %s <bmc> [args]   (or set IPMI_HOST / IPMI_PASS)"
+             % os.path.basename(sys.argv[0]))
 
 
 def raw(c, cmd, data):

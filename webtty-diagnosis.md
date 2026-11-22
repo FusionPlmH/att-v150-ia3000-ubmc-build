@@ -23,7 +23,7 @@ Web UI → System > BMC > **Console (Shell)** 页面一直转圈，终端不出�
 ```
 [error] connect() failed (110: Connection timed out) while connecting to upstream,
         request: "GET /ws HTTP/1.1", upstream: "http://0.0.0.0:7681/ws",
-        host: "192.168.31.72"
+        host: "<bmc>"
         2026/11/21 08:51:37  client: 192.168.31.74
         2026/11/21 08:53:50  client: 192.168.31.74
 ```

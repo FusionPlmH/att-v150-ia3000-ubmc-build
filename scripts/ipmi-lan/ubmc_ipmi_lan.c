@@ -378,21 +378,47 @@ static void trim(char *s)
         *--p = '\0';
 }
 
+/*
+ * First start: there is no user file yet, so create one with a *random*
+ * password rather than a known default.  A fixed default would be published
+ * the moment this source is, and would then be the password of every BMC
+ * built from it.
+ */
 static void write_default_passwd(void)
 {
-    FILE *f = fopen(PASSWD_FILE, "w");
+    char pw[17];
+    size_t i;
+    FILE *rnd;
+    FILE *f;
+
+    rnd = fopen("/dev/urandom", "rb");
+    if (rnd == NULL || fread(pw, 1, 16, rnd) != 16) {
+        if (rnd != NULL)
+            fclose(rnd);
+        logmsg("cannot read /dev/urandom, not creating %s", PASSWD_FILE);
+        return;
+    }
+    fclose(rnd);
+    for (i = 0; i < 16; i++)
+        pw[i] = "0123456789abcdef"[pw[i] & 0x0f];
+    pw[16] = '\0';
+
+    f = fopen(PASSWD_FILE, "w");
     if (!f) {
         logmsg("cannot create %s: %s", PASSWD_FILE, strerror(errno));
         return;
     }
-    fprintf(f, "# IPMI over LAN credentials, one user:password per line.\n");
+    fprintf(f, "# IPMI over LAN credentials, one \"id:name:password:max-priv:enabled\""
+               " per line.\n");
     fprintf(f, "# RMCP+ derives its session keys from the plaintext password,\n");
     fprintf(f, "# so these cannot come from /etc/shadow.  Keep this file 0600.\n");
-    fprintf(f, "root:51L1C0M201B\n");
-    fprintf(f, "is_admin:51L1C0M201B\n");
+    fprintf(f, "# The password below was generated randomly; change it with\n");
+    fprintf(f, "#   ipmitool -I lanplus -H <bmc> -U root -P <this> user set password 1 <new>\n");
+    fprintf(f, "1:root:%s:4:1\n", pw);
     fclose(f);
     chmod(PASSWD_FILE, 0600);
-    logmsg("created default %s", PASSWD_FILE);
+    logmsg("created %s with a random password for user root: %s",
+           PASSWD_FILE, pw);
 }
 
 /*

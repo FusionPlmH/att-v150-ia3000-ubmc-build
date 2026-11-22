@@ -8,10 +8,11 @@ ConnectionRefusedError instead of a silent timeout.
 usage: probe623.py [host]
 """
 import socket
+import os
 import sys
 import time
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.31.72"
+HOST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("IPMI_HOST", "")
 PORT = 623
 
 
