@@ -935,11 +935,41 @@ static int sdr_user_add(const uint8_t *rec, int len)
 }
 
 /* vendor slots are 20 bytes; IPMI wants standard 16-byte records */
+/*
+ * Records come out of the vendor file in *slot* order, and the slot order is
+ * not the record-ID order: the vendor daemon reuses slots, so after a delete
+ * the file can hold id 0x00c0 followed by id 0x0030.  Clients page through the
+ * SEL by following the "next record id" field, so a link that goes backwards
+ * makes them loop forever (pyghmi does exactly that).  Hence: sort by record
+ * id and drop older records that share one -- for a client the id *is* the
+ * slot identity, so the newest occupant is the record.
+ */
+static unsigned sel_id_of(const uint8_t *rec)
+{
+    return (unsigned)rec[0] | ((unsigned)rec[1] << 8);
+}
+
+static int sel_rec_cmp(const void *a, const void *b)
+{
+    const uint8_t *ra = (const uint8_t *)a, *rb = (const uint8_t *)b;
+    unsigned ia = sel_id_of(ra), ib = sel_id_of(rb);
+
+    if (ia != ib)
+        return ia < ib ? -1 : 1;
+    /* same id: newest first so the de-dup pass keeps the live record */
+    {
+        uint32_t ta = rd_le32(ra + 3), tb = rd_le32(rb + 3);
+        if (ta == tb)
+            return 0;
+        return ta > tb ? -1 : 1;
+    }
+}
+
 static int sel_load(uint8_t *out, int maxrec)
 {
     FILE *f = fopen(SEL_FILE, "rb");
     uint8_t slot[SEL_SLOT];
-    int n = 0;
+    int i, n = 0, keep = 0;
 
     if (!f)
         return 0;
@@ -965,7 +995,17 @@ static int sel_load(uint8_t *out, int maxrec)
         n++;
     }
     fclose(f);
-    return n;
+
+    if (n > 1)
+        qsort(out, (size_t)n, 16, sel_rec_cmp);
+    for (i = 0; i < n; i++) {
+        if (keep > 0 && sel_id_of(out + keep * 16 - 16) == sel_id_of(out + i * 16))
+            continue;                   /* older record in the same slot */
+        if (keep != i)
+            memcpy(out + keep * 16, out + i * 16, 16);
+        keep++;
+    }
+    return keep;
 }
 
 static uint32_t sel_last_timestamp(void)

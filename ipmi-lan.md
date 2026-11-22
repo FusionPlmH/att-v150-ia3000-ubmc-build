@@ -178,6 +178,26 @@ mv -f /config/firmware/ubmc_ipmi_lan.new /config/firmware/ubmc_ipmi_lan
 会显示成 `0.0 seconds` 的"间隔"。现在默认 `0x02`（应答 ARP：内核本来就在做），
 Gratuitous ARP 只存储、不主动发（没有实现）。
 
+### 第三个坑：SEL 的「下一条记录 ID」不能往回跳
+
+`Get SEL Info` 报 197 条，`ipmitool sel list` 能列出 192 条，而 pyghmi 的
+`get_event_log()` **永远不返回**（一直转，实测 1900 次请求后卡死）。原因不在客户端：
+
+厂商的 SEL 是**定长槽文件**，记录 ID 就是槽号。我们早先在测试里清过 198/199
+两个槽，厂商守护进程随后**从低位槽重新开始写**，于是文件顺序变成
+`… 0x00c0` 后面跟着 `0x0030 …`。而 `Get SEL Entry` 的「下一条记录 ID」按
+**文件顺序**回，客户端按 ID 单向前进分页 → 走到 0xC0 被指回 0x30 → 无限循环。
+
+修法：`sel_load()` 读完后**按记录 ID 排序**，再丢掉 ID 重复的旧记录
+（对客户端来说 ID 就是槽的身份，同一个槽里只有最新那条算数）。这样
+ID 单调递增、最后一条的 next 是 `0xffff`，分页一定能结束。
+
+实测：`sel info` = 191 条、`sel list` = 191 行、`get_event_log()` = 191 条 / 1.2 秒，
+三者一致（修复前分别是 197 / 192 / 不返回）。
+
+> 教训：**客户端卡死不一定怪客户端**。`ipmitool` 不按 ID 分页（它按序号读），
+> 所以只有 pyghmi 会暴露这个 bug —— 两个客户端交叉验证才看得出来。
+
 ### 第二个 VRF 坑：PET 的发送 socket 也要绑（第二十五轮收尾）
 
 IPMI 的监听 socket 绑到 `vrf-pub` 之后，`pet_send()` 里那个**新开的** socket
