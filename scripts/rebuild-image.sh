@@ -189,9 +189,16 @@ cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #    没通过。这里在 mgmtd 生成的 nginx.conf 里补两条 location，把标准路径
 #    映射到已经能工作的 /cgi-bin/sweb/<api>。
 #
-#    这条也上游化不了：nginx.conf 由 is_mgmtd_start_nginx 整份生成，模板
-#    编在 /usr/bin/is_mgmtd 里（strings 只有 location / 和 location /ws 两
-#    条 proxy_pass），配置树里也没有可注入 location 的键。
+#    这条也上游化不了，证据见 web-stack.md 第七节：nginx.conf 由
+#    is_mgmtd_start_nginx 整份生成，模板编在 /usr/bin/is_mgmtd 里（整段
+#    strings 可见，只有 location / 和 location ^~ /ws 两条 proxy_pass），
+#    模板只读 /config/system/service/{http,https}/{enabled,port} 四个键，
+#    配置树里没有能注入 location 的地方。旁路也都不成立：uhttpd 的 CGI
+#    前缀只能给一个；往 http{} 的 include 里塞 server{} 会因为 listen/
+#    server_name 完全相同而永远不可达。
+#
+#    所以这里补完必须满足三点：幂等、锚点不存在就不动、nginx -t 通过才
+#    替换并 HUP（见下面的 enable_api_routes）。
 
 wait_mgmtd()
 {

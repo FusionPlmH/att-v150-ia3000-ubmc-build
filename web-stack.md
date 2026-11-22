@@ -276,3 +276,68 @@ GET /redfish/v1/Chassis/Members/0/Power -> 200
 ```
 
 认证：`curl -k -u is_admin:<password> https://<bmc>/redfish/v1`
+
+## 七、为什么这部分「上游化」不了（把证据列全）
+
+目标曾经是「把 `/restapi` `/redfish` 的路由交给 mgmtd 自己的模板生成，
+`S46is_web_fw` 可以整个删掉」。防火墙那一半**已经做到了**（`S44is_fw_conf` 把
+`pub-ipmi` / `pub-console` / `pub-http` 写进 `iptables-rule` 树，mgmtd 启动时
+自己 `-I INPUT`），路由这一半**做不到**，原因如下。
+
+### 1. 模板是硬编码的，只读四个键
+
+`is_mgmtd_start_nginx` 里那份模板（`strings /usr/bin/is_mgmtd` 可以整段看到）：
+
+```nginx
+events { worker_connections 1024; }
+http {
+    access_log off;  error_log /tmp/nginx_error.log;
+    include mime.types;  default_type application/octet-stream;
+    sendfile off;  keepalive_timeout 600;  ...
+    server { listen %d; listen [::]:%d; server_name localhost;
+             return 301 https://$host$request_uri; }
+    server {
+        listen %d ssl;  listen [::]:%d ssl;  listen 443 ssl;  listen [::]:443 ssl;
+        server_name localhost;  client_max_body_size 1000m;
+        ssl_certificate nginx_ssl.crt;  ssl_certificate_key nginx_ssl.key;  ...
+        location / { ... proxy_pass http://%s:%d; }
+        location ^~ /ws { proxy_pass http://%s:%d/ws; ... }
+    }
+}
+```
+
+`%d` / `%s:%d` 只有这几个来源：
+
+```
+/config/system/service/http/enabled      /config/system/service/http/port
+/config/system/service/https/enabled     /config/system/service/https/port
+```
+
+**整份文件里没有第二个 server、没有 include 目录、没有任何占位符留给 location。**
+
+### 2. 三条旁路都试过，都不成立
+
+| 想法 | 为什么不成立 |
+|---|---|
+| 让 **uhttpd** 自己把 `/restapi` 当 CGI | uhttpd 的 `-x`（CGI 前缀）**只能给一个**，它自己的 usage 写着 `-x string  URL prefix for CGI handler, default is '/cgi-bin'`；启动命令来自 `/opt/silc-web/silc-web-start.sh`，只设了 docroot，连 `-x` 都没传。两个前缀无法共存 |
+| 往 `include mime.types;` 里塞一个 `server{}` | 语法上**可以**（`include` 在 `http{}` 里），但新 server 的 `listen 443 ssl; server_name localhost;` 与原模板完全相同 → nginx 只会用**第一个**匹配的 server，我们那块永远不可达 |
+| 找一个配置键注入 location | 配置树里唯一的自由文本入口是 `iptables-rule/<name>/rule`，它只喂给 iptables。`config/system/{mgmt,service,misc}` 下没有 nginx 相关的键 |
+
+### 3. 所以只能「生成后补」，关键是要补得稳
+
+`S46is_web_fw` 现在的做法，三条硬性要求都满足了：
+
+- **幂等**：`grep -q ubmc-api-routes`，已经补过就跳过
+- **锚点存在才动手**：`grep -q 'location.*/ws'`，模板变了就什么也不做（宁可没有路由，也不写出半份坏配置）
+- **先校验再上电**：写到 `nginx.conf.new`，`nginx -t` 通过才 `mv` + 给每个 nginx 发 `SIGHUP`；不通过就删掉、原文件不动
+
+### 4. 顺带记两个容易误解的事实
+
+- **nginx 是「每个 VRF 一个实例」**：`vrf-process-list` 里 `web` 在 `vrf-pub` /
+  `vrf-ib` / `vrf-ib-vlan` 三处都有，所以开机后有 **3 个 nginx master**（实测
+  pid 三个）、3 个 uhttpd、3 个 `hostenv.sh`。改 nginx.conf 后要对**每个** pid 发 HUP。
+- **58080 对局域网是故意不通的**：mgmtd 自己给每个 VRF 插了一条
+  `-i <vrf> -p tcp --dport 58080 -m mac ! --mac-source <该 VRF 设备的 MAC> -j DROP`。
+  只有「从本机 VRF 自己绕出去」的流量（也就是 nginx）能到 uhttpd，外部直连
+  58080 会超时。所以在局域网里测「绕过 nginx 直接访问 /restapi」永远失败，
+  那是设计如此，不是坏。
