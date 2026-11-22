@@ -224,8 +224,8 @@ curl -k -u is_admin:<password> https://<bmc>/restapi/v1         # 403 同上
 1. **URL 至少要 4 段**：`restapi` 之后的路径深度由 `MIN_DEPTH=4`
    （`restapi.lua` 第 298 行）卡住，`/restapi` 和 `/restapi/v1` 永远返回 403，
    跟权限无关。所以根路径不可能"探活用 200"。
-2. **账号要有权限**：`is_admin` / `root` 能过，普通 Web 用户（比如 `peter`）
-   一律 401。路径写错时返回的是**带 JSON 体的 404**
+2. **账号要有权限**：实测 `root` / `is_admin` 得 200，`peter` 得 **401**。
+   路径写错时返回的是**带 JSON 体的 404**
    （`{"error":{"message":"The resource ... is not found."}}`）—— 这反而是路由活着的证据。
 
 公开源码 `silicom-ltd/uBMC` 里就没有 `restapi.lua` / `redfish.lua`，
