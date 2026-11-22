@@ -1,0 +1,82 @@
+#!/usr/bin/env python
+"""ipmi-selfcheck - ask the local IPMI listener whether it can hear us.
+
+Sends a well-formed IPMI 1.5 Get Channel Authentication Capabilities request
+(the pre-session query every client makes first) to <host>:623 and exits 0 if
+an answer comes back.
+
+Used by /etc/init.d/S47is_ipmi_lan: a daemon started too early in boot ends up
+with a socket that never sees traffic arriving on the VRF slave, and restarting
+it once the network is up fixes it.  Rather than guess the kernel timing, the
+init script asks the daemon directly.
+
+Kept compatible with Python 2.6+ so it runs on this rootfs (2.7) as well as on
+a developer machine.
+
+The listener binds to the vrf-pub device, not to the wildcard address, so
+probing 127.0.0.1 can never work -- the default target is the management
+address on eth1.
+
+usage: ipmi-selfcheck [host] [timeout-seconds]
+"""
+import socket
+import subprocess
+import sys
+
+PORT = 623
+
+
+def management_ip(dev="eth1"):
+    """First IPv4 address on dev, or 127.0.0.1 when there is none yet."""
+    try:
+        out = subprocess.Popen(["ip", "-4", "-o", "addr", "show", "dev", dev],
+                               stdout=subprocess.PIPE).communicate()[0]
+        if not isinstance(out, str):
+            out = out.decode("ascii", "replace")
+        for tok in out.split():
+            if tok.count(".") == 3 and "/" in tok:
+                return tok.split("/")[0]
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+HOST = sys.argv[1] if len(sys.argv) > 1 else management_ip()
+TIMEOUT = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
+
+
+def request():
+    rmcp = [0x06, 0x00, 0xFF, 0x07]
+    # auth type none, seq 0, session 0, 9 byte payload
+    session = [0x00] + [0] * 8 + [9]
+    # rsAddr, netFn App/lun0, chk, rqAddr, rqSeq, cmd 0x38, ch, priv, chk
+    body = [0x20, 0x18, 0x00, 0x81, 0x04, 0x38, 0x8E, 0x04, 0x00]
+    body[2] = (0x100 - (body[0] + body[1])) & 0xFF
+    body[8] = (0x100 - sum(body[3:8])) & 0xFF
+    return bytearray(rmcp + session + body)
+
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(TIMEOUT)
+    sock.connect((HOST, PORT))
+    try:
+        sock.send(bytes(request()))
+        reply = sock.recv(2048)
+    except socket.timeout:
+        sys.stderr.write("ipmi-selfcheck: no reply from %s:%d\n" % (HOST, PORT))
+        return 1
+    except socket.error as exc:
+        sys.stderr.write("ipmi-selfcheck: %s from %s:%d\n"
+                         % (exc, HOST, PORT))
+        return 1
+    finally:
+        sock.close()
+    if len(reply) < 20:
+        sys.stderr.write("ipmi-selfcheck: short reply (%d bytes)\n" % len(reply))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

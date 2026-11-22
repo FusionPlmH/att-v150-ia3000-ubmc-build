@@ -22,3 +22,8 @@ __pycache__/
 *.pyc
 .vscode/
 .DS_Store
+
+# 静态交叉编译的守护进程：构建机重启后 buildroot 工具链就没了，
+# 所以把产物留在仓库里（rebuild-image.sh 优先用它）。
+# .gz 只是往真机上传输用的中转文件，不进来。
+/prebuilt/*.gz

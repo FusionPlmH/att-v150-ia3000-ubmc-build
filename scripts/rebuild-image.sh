@@ -53,8 +53,17 @@ printf '%s\n' "$PUBKEY" > "$R/root/.ssh/authorized_keys"
 chmod 700 "$R/root/.ssh"; chmod 600 "$R/root/.ssh/authorized_keys"
 
 V="$R/etc/product/UBMC/version"
-echo -n '##UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c##'    > "$V/software_version.txt"
-echo -n '##UBMC_FW_1.1.0.5_LOCAL_BUILD_bd9de8c##' > "$V/firmware_version.txt"
+# FW_REV 让 Web UI 上能一眼看出刷的是哪一轮本地构建：
+# 默认取输出目录名里的编号（/root/build-v19 -> v19）
+FW_REV=${FW_REV:-}
+if [ -z "$FW_REV" ]; then
+    case "$(basename "$OUT")" in
+        build-v*) FW_REV=${OUT##*build-} ;;
+        *)        FW_REV=local ;;
+    esac
+fi
+echo -n "##UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c_${FW_REV}##"    > "$V/software_version.txt"
+echo -n "##UBMC_FW_1.1.0.5_LOCAL_BUILD_bd9de8c_${FW_REV}##" > "$V/firmware_version.txt"
 
 cp -f "$MGMTD_LIB" "$R/usr/lib/libprod_mgmtd_inst.so.0.0.0"
 cp -f "$MGMTD_LIB" "$R/usr/lib32/libprod_mgmtd_inst.so.0.0.0"
@@ -141,29 +150,32 @@ cp -a "$FACTORY/usr/share/snmp/mibs/SNMP-USM-HMAC-SHA2-MIB.txt" "$R/usr/share/sn
 mkdir -p "$R/var/log/nginx"
 
 echo "=== 6.5 nginx 转发链与 Web UI 补丁 ==="
-# 1) 防火墙：vrf-pub 的兜底 DROP 缺 7681（ttyd）和 80（301 跳转）的例外
-# 2) /etc/config/luci：缺失时所有 /admin 页面都会 Authorization Required
-# 3) nginx 路由：把 /restapi 与 /redfish 接到可用的 CGI 上
+# 1) 防火墙：把 7681/80/623 的例外"上游化"进 is_mgmtd.conf，由 mgmtd 自己下发
+#    （S44 脚本，必须在 S45is_mgmtd 之前跑）
+# 2) 7681 的 hairpin DROP（VRF MAC 每次启动随机，无法写进静态配置）
+# 3) /etc/config/luci：缺失时所有 /admin 页面都会 Authorization Required
+# 4) nginx 路由：把 /restapi 与 /redfish 接到可用的 CGI 上
+IPMI_DIR="$SCRIPT_DIR/ipmi-lan"
+install -m 755 "$IPMI_DIR/S44is_fw_conf" "$R/etc/init.d/S44is_fw_conf"
+sh -n "$R/etc/init.d/S44is_fw_conf"
+echo "    已安装 S44is_fw_conf（防火墙例外 7681/80/623 上游化）"
+
 cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #!/bin/sh
 #
-# nginx 转发链与 Web UI 所需的补丁。
+# Web Console / REST 剩下必须运行时做的事。
 #
-# 1) 防火墙例外
-#    ATT 的默认配置在 vrf-pub 上有一条兜底规则：
-#        -I INPUT -i vrf-pub -j DROP
-#    is_mgmtd 建完这条规则后，只用它自己那个模板给后端端口 uhttpd:58080
-#    补例外，其余 nginx 相关端口全漏了：
+# 1) 7681 的 hairpin 限制（唯一必须运行时插入的防火墙规则）
+#    ttyd 绑在 0.0.0.0%vrf-pub:7681，nginx 只能从 vrf-pub 出去再绕回来
+#    （hairpin），所以需要一条 7681 的例外。但放行本身已经交给 mgmtd 了
+#    （S44 把它写进了 is_mgmtd.conf 的 iptables-rule 树）。
 #
-#      7681  ttyd —— nginx 的 /ws 上游（Web Console Shell）。
-#            nginx 从 vrf-pub 出去再绕回来（hairpin），源 MAC 是 vrf-pub
-#            自己的 MAC。缺例外 → /ws 永远握手不上，Console 页面一直转圈。
+#    这里补的是**限制**：只允许「源 MAC = vrf-pub 自身 MAC」的 hairpin，
+#    局域网直连 7681 仍然 DROP —— 否则等于把没有认证的 ttyd 敞开给整个
+#    局域网，等于把主机串口终端送人。
 #
-#      80    nginx 的 HTTP 端口，只做 301 跳转到 https://。
-#            缺例外 → 浏览器打开 http://<bmc>/ 一直转圈而不跳转。
-#
-#    7681 沿用 58080 的做法：只放行「源 MAC = vrf-pub 自身 MAC」的流量，
-#    局域网直连 7681 仍然 DROP。80 只回一个 301，允许外部访问。
+#    这条写不进静态配置，因为 VRF 设备的 MAC 是内核每次创建时随机生成的
+#    （实测两次启动 BA:A4:9B:54:1F:E1 → C6:07:74:EF:E3:40），只能运行时读。
 #
 # 2) LuCI 会话配置
 #    LuCI 把会话目录写在 /etc/config/luci 的 sauth.sessionpath 里，这个文件
@@ -176,6 +188,10 @@ cat > "$R/etc/init.d/S46is_web_fw" <<'WEBFW'
 #    放在 docroot 根目录的脚本只会被当静态文件下载 —— 所以 /restapi 从来
 #    没通过。这里在 mgmtd 生成的 nginx.conf 里补两条 location，把标准路径
 #    映射到已经能工作的 /cgi-bin/sweb/<api>。
+#
+#    这条也上游化不了：nginx.conf 由 is_mgmtd_start_nginx 整份生成，模板
+#    编在 /usr/bin/is_mgmtd 里（strings 只有 location / 和 location /ws 两
+#    条 proxy_pass），配置树里也没有可注入 location 的键。
 
 wait_mgmtd()
 {
@@ -195,19 +211,9 @@ drop_pos()
     [ -n "${lineno}" ] && echo $((lineno - 1)) || echo 0
 }
 
-# 插到兜底 DROP 之前；位置按当前链算，不依赖脚本相对 mgmtd 的执行时机
-insert_accept()
-{
-    vrf="$1"
-    port="$2"
-    if ! iptables -C INPUT -i ${vrf} -p tcp --dport ${port} -j ACCEPT 2>/dev/null; then
-        pos=$(drop_pos ${vrf})
-        [ "${pos}" -gt 1 ] || pos=2
-        iptables -I INPUT ${pos} -i ${vrf} -p tcp --dport ${port} -j ACCEPT
-    fi
-}
-
-# 只允许 nginx 的 hairpin（源 MAC = VRF 设备自身 MAC）
+# 只允许 nginx 的 hairpin（源 MAC = VRF 设备自身 MAC）。
+# 放行规则本身由 mgmtd 从 is_mgmtd.conf 下发（见 S44is_fw_conf），这里只补
+# 这条限制。VRF MAC 每次启动随机，所以只能运行时读。
 allow_hairpin()
 {
     vrf="$1"
@@ -221,13 +227,6 @@ allow_hairpin()
         iptables -I INPUT 1 -i ${vrf} -p tcp --dport ${port} \
             -m mac ! --mac-source ${mac} -j DROP
     fi
-    insert_accept ${vrf} ${port}
-}
-
-allow_open()
-{
-    [ -e /sys/class/net/$1 ] || return 0
-    insert_accept "$1" "$2"
 }
 
 ensure_luci_config()
@@ -284,7 +283,6 @@ case "$1" in
     start)
         wait_mgmtd
         allow_hairpin vrf-pub 7681
-        allow_open    vrf-pub 80
         ensure_luci_config
         enable_api_routes
         ;;
@@ -292,10 +290,8 @@ case "$1" in
         vrf=vrf-pub
         if [ -e /sys/class/net/${vrf} ]; then
             mac=$(cat /sys/class/net/${vrf}/address)
-            iptables -D INPUT -i ${vrf} -p tcp --dport 7681 -j ACCEPT 2>/dev/null
             iptables -D INPUT -i ${vrf} -p tcp --dport 7681 \
                 -m mac ! --mac-source ${mac} -j DROP 2>/dev/null
-            iptables -D INPUT -i ${vrf} -p tcp --dport 80 -j ACCEPT 2>/dev/null
         fi
         ;;
     *)
@@ -505,20 +501,35 @@ echo "=== 6.7 IPMI over LAN (RMCP+ / udp 623) ==="
 IPMI_DIR="$SCRIPT_DIR/ipmi-lan"
 HOSTBIN=/root/uBMC-fork/buildroot/output/host/bin
 SYSROOT=/root/uBMC-fork/buildroot/output/host/arm-buildroot-linux-gnueabihf/sysroot
+PREBUILT=${PREBUILT_IPMI_LAN:-$SCRIPT_DIR/../prebuilt/ubmc_ipmi_lan}
 
 [ -f "$IPMI_DIR/ubmc_ipmi_lan.c" ] || { echo "!! 缺少 $IPMI_DIR/ubmc_ipmi_lan.c"; exit 1; }
+[ -f "$IPMI_DIR/S44is_fw_conf" ]    || { echo "!! 缺少 $IPMI_DIR/S44is_fw_conf"; exit 1; }
 [ -f "$IPMI_DIR/S47is_ipmi_lan" ]   || { echo "!! 缺少 $IPMI_DIR/S47is_ipmi_lan"; exit 1; }
-[ -x "$HOSTBIN/arm-linux-gnueabihf-gcc" ] || { echo "!! 缺少交叉编译器"; exit 1; }
+[ -f "$IPMI_DIR/ipmi-selfcheck" ]   || { echo "!! 缺少 $IPMI_DIR/ipmi-selfcheck"; exit 1; }
 
-"$HOSTBIN/arm-linux-gnueabihf-gcc" --sysroot="$SYSROOT" -O2 -Wall \
-    -o "$R/usr/sbin/ubmc_ipmi_lan" "$IPMI_DIR/ubmc_ipmi_lan.c" \
-    -L"$SYSROOT/usr/lib" -lcrypto
-"$HOSTBIN/arm-linux-gnueabihf-strip" "$R/usr/sbin/ubmc_ipmi_lan" 2>/dev/null || true
-chmod 755 "$R/usr/sbin/ubmc_ipmi_lan"
+# 静态链接的预编译产物优先：/ 是 ramdisk，buildroot 工具链重启就没了，
+# 而静态二进制不依赖镜像里的 libc/libcrypto 版本（见 ipmi-lan/build-cross.sh）
+if [ -x "$PREBUILT" ]; then
+    install -m 755 "$PREBUILT" "$R/usr/sbin/ubmc_ipmi_lan"
+    echo "    使用预编译产物 $PREBUILT（静态链接）"
+elif [ -x "$HOSTBIN/arm-linux-gnueabihf-gcc" ]; then
+    "$HOSTBIN/arm-linux-gnueabihf-gcc" --sysroot="$SYSROOT" -O2 -Wall \
+        -o "$R/usr/sbin/ubmc_ipmi_lan" "$IPMI_DIR/ubmc_ipmi_lan.c" \
+        -L"$SYSROOT/usr/lib" -lcrypto
+    "$HOSTBIN/arm-linux-gnueabihf-strip" "$R/usr/sbin/ubmc_ipmi_lan" 2>/dev/null || true
+    chmod 755 "$R/usr/sbin/ubmc_ipmi_lan"
+    echo "    用 buildroot 交叉编译器现场编译"
+else
+    echo "!! 既没有 $PREBUILT，也没有交叉编译器"; exit 1
+fi
 echo "    ubmc_ipmi_lan $(stat -c%s "$R/usr/sbin/ubmc_ipmi_lan") 字节"
 
 install -m 755 "$IPMI_DIR/S47is_ipmi_lan" "$R/etc/init.d/S47is_ipmi_lan"
+install -m 755 "$IPMI_DIR/ipmi-selfcheck" "$R/usr/sbin/ipmi-selfcheck"
+sh -n "$R/etc/init.d/S47is_ipmi_lan"
 echo "    /etc/init.d/S47is_ipmi_lan 已安装"
+echo "    /usr/sbin/ipmi-selfcheck 已安装（诊断用：本机问一次 udp/623 是否有应答）"
 
 echo "=== 7. 清理并打包 ==="
 # init.d 必须是普通名字，rcS 在运行时会自己改成 IS_*

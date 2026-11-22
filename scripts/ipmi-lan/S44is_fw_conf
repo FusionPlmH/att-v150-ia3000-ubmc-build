@@ -1,0 +1,87 @@
+#!/bin/sh
+#
+# 把 Web/IPMI 相关的防火墙例外写进 is_mgmtd.conf，让 mgmtd 自己去下发。
+#
+# 为什么不直接 iptables：
+#   mgmtd 按 /config/system/mgmt/iptables-rule/<name>/rule 逐条执行，
+#   插入顺序＝文件顺序（每条都是 -I INPUT，所以后写的最终在上）。它自己
+#   已有的 pub-web(443)/pub-web-be(58080) 就是这么来的。把 7681/80/623 加进
+#   同一棵树，规则就由 mgmtd 在它自己的时机装好。
+#
+#   直接在 S47 里 iptables -I 是**不行**的：S47 插完以后，mgmtd 才一条条
+#   -I INPUT 1 下发它自己的规则，把我们那条一路推到它自己的
+#   `-i vrf-pub -j DROP` 下面 —— IPMI 于是被静默丢弃，现象是「开机后 IPMI
+#   不通，手动 restart 一次就好」（restart 时 DROP 已存在，插在了它上面）。
+#
+# 为什么必须在 S45is_mgmtd 之前：mgmtd 只在启动时读这份配置。晚于它就只
+# 能下一轮开机才生效。所以这个脚本叫 S44。
+#
+# /config 是 mmcblk0p5 独立分区，镜像里的 /config 会被挂载覆盖，所以只能
+# 在运行时改（本脚本幂等，缺哪条补哪条）。
+#
+# 校验和：S45is_mgmtd 的 validate_conf() 会 sha1sum -c，对不上就把 conf
+# 删掉并回滚 .backup —— 所以改完必须重算，且路径要写成 /config/is_mgmtd.conf。
+
+CONF=/config/is_mgmtd.conf
+SUM=/config/is_mgmtd.conf.sha1sum
+ANCHOR='/config/system/mgmt/iptables-rule/pub-web-be/rule,'
+NL='
+'
+
+[ -e "$CONF" ] || exit 0
+
+# name|rule —— 越靠后＝最终在 INPUT 链里越靠上
+SPECS='pub-console|-I INPUT -i vrf-pub -p tcp --dport 7681 -j ACCEPT
+pub-http|-I INPUT -i vrf-pub -p tcp --dport 80 -j ACCEPT
+pub-ipmi|-I INPUT -i vrf-pub -p udp --dport 623 -j ACCEPT'
+
+missing=0
+old_ifs=$IFS
+IFS=$NL
+for spec in $SPECS; do
+    name=${spec%%|*}
+    grep -q "iptables-rule/$name," "$CONF" || missing=1
+done
+IFS=$old_ifs
+[ "$missing" = 1 ] || exit 0
+
+cp -a "$CONF" "$CONF.pre-fw-upstream"
+
+BLOCK=/tmp/is_mgmtd.fw.$$
+: > "$BLOCK"
+old_ifs=$IFS
+IFS=$NL
+for spec in $SPECS; do
+    name=${spec%%|*}
+    rule=${spec#*|}
+    grep -q "iptables-rule/$name," "$CONF" && continue
+    {
+        echo "/config/system/mgmt/iptables-rule/$name,"
+        echo "/config/system/mgmt/iptables-rule/$name/version,ipv4"
+        echo "/config/system/mgmt/iptables-rule/$name/table,filter"
+        echo "/config/system/mgmt/iptables-rule/$name/priority,10"
+        echo "/config/system/mgmt/iptables-rule/$name/rule,$rule"
+    } >> "$BLOCK"
+done
+IFS=$old_ifs
+
+awk -v bf="$BLOCK" -v anchor="$ANCHOR" '
+BEGIN { while ((getline line < bf) > 0) blk = blk line "\n" }
+index($0, anchor) == 1 { print; printf "%s", blk; next }
+{ print }
+' "$CONF" > /tmp/is_mgmtd.conf.new || exit 1
+
+# 锚点缺失时 awk 会原样输出副本，别白改校验和
+if cmp -s "$CONF" /tmp/is_mgmtd.conf.new; then
+    rm -f /tmp/is_mgmtd.conf.new "$BLOCK"
+    logger -s "is_fw_conf: 找不到插入锚点，配置未改动"
+    exit 1
+fi
+
+mv -f /tmp/is_mgmtd.conf.new "$CONF"
+rm -f "$BLOCK"
+h=$(sha1sum "$CONF" | awk '{print $1}')
+printf '%s  /config/is_mgmtd.conf\n' "$h" > "$SUM"
+sync
+logger -s "is_fw_conf: 7681/80/623 例外已写入 is_mgmtd.conf（校验和已更新）"
+exit 0

@@ -7,20 +7,39 @@
 # This service adds the LAN listener and maps chassis commands onto the vendor
 # tooling (/usr/sbin/ubmc_sys_ctrl.sh).
 #
-# Notes:
-#   * the daemon binds a wildcard udp/623 socket -- a socket bound to the
-#     vrf-pub device does NOT receive traffic that arrives on its slave (eth1),
-#     which is why the listener deliberately stays interface agnostic
-#   * is_mgmtd rebuilds the INPUT chain early in boot, so the udp/623 accept
-#     rule is inserted only after /tmp/mgmtd_started appears
+# Notes
+#   * eth1 (the OOB port) is a slave of the vrf-pub VRF device, so its routes
+#     live in table 300 and the main table has no route to the LAN at all.
+#     A wildcard listener is therefore useless in both directions: the kernel
+#     will not hand it packets that arrive on a VRF slave unless
+#     net.ipv4.udp_l3mdev_accept is set, and even then its replies are routed
+#     through the main table and fail with ENETUNREACH.  So bind the socket to
+#     the VRF device itself -- the kernel then matches on sdif (rx) and picks
+#     table 300 for the source address and route (tx).
+#   * the daemon must only be started once eth1 is actually enslaved; a start
+#     before `ip link set eth1 master vrf-pub` leaves the listener working in
+#     one direction only.  wait_ready() enforces that.
+#   * the udp/623 ACCEPT lives in /config/is_mgmtd.conf (see S44is_fw_conf) so
+#     that is_mgmtd installs it above its own `-i vrf-pub -j DROP`.  Inserting
+#     it here instead gets pushed below that DROP later in boot, which looks
+#     exactly like "IPMI only starts working after a restart"
 #   * credentials live in /config (persistent ext4) because RMCP+ derives its
 #     keys from the plaintext password and /etc/shadow cannot provide that
 
 DAEMON=/usr/sbin/ubmc_ipmi_lan
 PASSWD=/config/ipmi-lan.passwd
+MGMTD_CONF=/config/is_mgmtd.conf
 LOG=/var/log/ipmi-lan.log
-STOPFLAG=/var/run/ipmi-lan.stop
-PIDFILE=/var/run/ipmi-lan.pid
+BINDDEV=
+
+# The root filesystem is a ramdisk, so anything installed into /usr/sbin is
+# gone after a reboot.  /config is a real ext4 partition, so a newer daemon can
+# be dropped in there and it wins over the copy that ships in the image -- that
+# is how the daemon gets updated without re-flashing a whole bank.
+CONFIG_DAEMON=/config/firmware/ubmc_ipmi_lan
+if [ -x "$CONFIG_DAEMON" ]; then
+    DAEMON=$CONFIG_DAEMON
+fi
 
 ensure_passwd() {
     [ -f "$PASSWD" ] && return 0
@@ -34,9 +53,37 @@ EOF
     echo "ipmi-lan: seeded $PASSWD with the default password"
 }
 
+# VRF device eth1 belongs to, empty when it is not enslaved
+eth1_master() {
+    m=$(readlink -f /sys/class/net/eth1/master 2>/dev/null) || return 0
+    [ -n "$m" ] && basename "$m"
+}
+
+# wait for the OOB port to have an address *and* its VRF master, so the
+# listener is born in the network the packets will actually arrive on
+wait_ready() {
+    i=0
+    while [ $i -lt 120 ]; do
+        BINDDEV=$(eth1_master)
+        if [ -n "$BINDDEV" ] &&
+           ip -4 -o addr show eth1 2>/dev/null | grep -q 'inet '; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    BINDDEV=
+    echo "ipmi-lan: eth1 not ready after ${i}s, falling back to a wildcard listener"
+    return 1
+}
+
+# Safety net only: while is_mgmtd.conf still carries the pub-ipmi rule, mgmtd
+# installs the ACCEPT itself and we must not race it.  Otherwise (conf rolled
+# back by mgmtd's checksum validation) put a rule above the vrf-pub DROP.
 open_firewall() {
     iptables -C INPUT -i vrf-pub -p udp --dport 623 -j ACCEPT 2>/dev/null && return 0
-    pos=$(iptables -S INPUT | grep -n -- '-i vrf-pub -j DROP' | head -1 | cut -d: -f1)
+    grep -q 'iptables-rule/pub-ipmi,' "$MGMTD_CONF" 2>/dev/null && return 0
+    pos=$(iptables -S INPUT 2>/dev/null | grep -n -- '-i vrf-pub -j DROP' | head -1 | cut -d: -f1)
     if [ -z "$pos" ]; then
         pos=1
     else
@@ -47,6 +94,15 @@ open_firewall() {
         || echo "ipmi-lan: could not open udp/623 (no vrf-pub yet)"
 }
 
+start_daemon() {
+    # still needed for the wildcard fallback path
+    echo 1 > /proc/sys/net/ipv4/udp_l3mdev_accept 2>/dev/null
+
+    # -d makes the daemon fork/setsid and reattach stderr to $LOG itself, so
+    # nothing here inherits the caller's stdout (the web RPC would hang on it)
+    IPMI_LAN_BIND="$BINDDEV" "$DAEMON" -d
+}
+
 start() {
     [ -x "$DAEMON" ] || { echo "ipmi-lan: $DAEMON missing"; return 1; }
     if pidof ubmc_ipmi_lan > /dev/null 2>&1; then
@@ -54,32 +110,16 @@ start() {
     fi
 
     ensure_passwd
-    rm -f "$STOPFLAG" "$PIDFILE"
-
-    # -d makes the daemon fork/setsid and reattach stderr to $LOG itself, so
-    # nothing here inherits the caller's stdout (the web RPC would hang on it)
-    "$DAEMON" -d || { echo "ipmi-lan: failed to start"; return 1; }
-
-    # give is_mgmtd its chance to finish the firewall first, then punch the hole
-    i=0
-    while [ ! -f /tmp/mgmtd_started ] && [ $i -lt 60 ]; do
-        sleep 1
-        i=$((i + 1))
-    done
+    wait_ready
+    start_daemon || { echo "ipmi-lan: failed to start"; return 1; }
     open_firewall
-    sleep 1
-    if pidof ubmc_ipmi_lan > /dev/null 2>&1; then
-        echo "ipmi-lan: listening on udp/623 (pid $(pidof ubmc_ipmi_lan))"
-    else
-        echo "ipmi-lan: NOT running, see $LOG"
-        return 1
-    fi
+
+    echo "ipmi-lan: listening on udp/623 dev=${BINDDEV:-any} (pid $(pidof ubmc_ipmi_lan), bin $DAEMON)"
+    return 0
 }
 
 stop() {
-    touch "$STOPFLAG"
     killall -q ubmc_ipmi_lan 2>/dev/null
-    rm -f "$PIDFILE"
     return 0
 }
 

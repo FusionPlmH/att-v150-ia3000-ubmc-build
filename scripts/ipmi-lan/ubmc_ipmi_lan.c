@@ -9,19 +9,19 @@
  *   chassis status / control  ->  /usr/sbin/ubmc_sys_ctrl.sh (-q -o -s -f -r -c)
  *   mc info                   ->  static device id
  *
- * Only cipher suite 3 is implemented (HMAC-SHA1 authentication, HMAC-SHA1-96
- * integrity, AES-CBC-128 confidentiality) because that is what ipmitool's
- * lanplus and most clients use by default.
+ * Cipher suites 3 (HMAC-SHA1 / SHA1-96 / AES-CBC-128) and 17/18/19
+ * (HMAC-SHA256 / SHA256-128) are implemented -- those cover ipmitool's lanplus
+ * default and the suites real BMCs advertise.
  *
  * Credentials: RMCP+ derives its keys from the *plaintext* password
  * (RAKP2/RAKP3 are HMACs keyed with it), so /etc/shadow is useless here -- a
  * one-way hash cannot produce those MACs.  Real BMCs therefore keep a separate
  * IPMI user list.  Ours lives in /config/ipmi-lan.passwd (persistent ext4
- * partition), one "user:password" per line.
+ * partition), one "id:name:password:max-privilege:enabled" per line.
  *
- * Build (cross):
- *   arm-linux-gnueabihf-gcc --sysroot=$SYS -O2 -o ubmc_ipmi_lan \
- *       ubmc_ipmi_lan.c -lcrypto
+ * Build: scripts/ipmi-lan/build-cross.sh (static, from WSL).  The root
+ * filesystem is a ramdisk, so the daemon must not depend on the image's
+ * libraries; see ipmi-lan.md.
  */
 
 #define _GNU_SOURCE
@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <syslog.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,7 +53,7 @@
 #include <unistd.h>
 
 #define IPMI_PORT        623
-#define MAX_SESSIONS     8
+#define MAX_SESSIONS     16
 #define MAX_PKT          1024
 #define MAX_SOCKS        8
 #define AUTHCODE_LEN     12          /* HMAC-SHA1 truncated to 96 bit */
@@ -110,8 +111,11 @@
 #define RMCP_INVALID_USER      0x0D
 
 typedef struct {
-    char name[17];
-    char pass[21];
+    uint8_t id;              /* IPMI user ID, 1..MAX_USERS */
+    char    name[17];
+    char    pass[21];
+    uint8_t priv;            /* max privilege: 1 callback .. 4 admin, 5 OEM */
+    uint8_t enabled;
 } ipmi_user_t;
 
 typedef struct {
@@ -169,6 +173,26 @@ typedef struct {
 
 static session_t   g_sessions[MAX_SESSIONS];
 static ipmi_user_t g_users[MAX_USERS];
+
+/* ------------------------------------------------------------ LAN params */
+/*
+ * The LAN parameters that are pure configuration (SNMP community, auth type
+ * enables, ARP control) live in one small file.  The community string is not
+ * cosmetic: it is the community used in the PET traps this daemon sends.
+ */
+#define LANPARAM_CONF "/config/ipmi-lan-params.conf"
+
+typedef struct {
+    char    community[18];
+    uint8_t auth_types;         /* param 1: supported auth types */
+    uint8_t auth_enables[5];    /* param 2: per privilege level */
+    uint8_t arp_control;        /* param 10 */
+    uint8_t garp_interval;      /* param 11: gratuitous ARP interval, 500ms units */
+} lan_params_t;
+
+static lan_params_t g_lan = {
+    "public", 0x15, { 0x15, 0x15, 0x15, 0x15, 0x15 }, 0x02, 0x00
+};
 static int         g_nusers;
 static uint32_t    g_next_id = 0x5a170000;
 
@@ -371,10 +395,23 @@ static void write_default_passwd(void)
     logmsg("created default %s", PASSWD_FILE);
 }
 
+/*
+ * User database.
+ *
+ * The file has two accepted shapes, one line per user:
+ *
+ *   name:password                          legacy, gets the next free id,
+ *                                          privilege 4 (administrator), enabled
+ *   id:name:password:max-priv:enabled       written by Set User Access below
+ *
+ * Plaintext passwords are required: RAKP uses the password itself as the HMAC
+ * key, so a hash from /etc/shadow is useless here.
+ */
 static void load_users(void)
 {
     FILE *f;
-    char line[128];
+    char line[160];
+    int next_id = 1;
 
     g_nusers = 0;
     f = fopen(PASSWD_FILE, "r");
@@ -387,35 +424,135 @@ static void load_users(void)
     chmod(PASSWD_FILE, 0600);
 
     while (fgets(line, sizeof(line), f) && g_nusers < MAX_USERS) {
-        char *colon;
+        char *field[5];
+        int nf = 0;
+        char *p;
+        ipmi_user_t *u;
+
         trim(line);
         if (line[0] == '#' || line[0] == '\0')
             continue;
-        colon = strchr(line, ':');
-        if (!colon)
+
+        p = line;
+        while (nf < 5) {
+            field[nf++] = p;
+            p = strchr(p, ':');
+            if (!p)
+                break;
+            *p++ = '\0';
+        }
+        if (nf < 2)
             continue;
-        *colon = '\0';
-        trim(line);
-        trim(colon + 1);
-        if (strlen(line) == 0 || strlen(line) > 16)
+
+        u = &g_users[g_nusers];
+        memset(u, 0, sizeof(*u));
+        if (nf >= 4) {
+            u->id      = (uint8_t)atoi(field[0]);
+            u->priv    = (uint8_t)atoi(field[3]);
+            u->enabled = nf >= 5 ? (uint8_t)(atoi(field[4]) ? 1 : 0) : 1;
+            snprintf(u->name, sizeof(u->name), "%s", field[1]);
+            snprintf(u->pass, sizeof(u->pass), "%s", field[2]);
+        } else {
+            u->id      = (uint8_t)next_id;
+            u->priv    = 4;
+            u->enabled = 1;
+            snprintf(u->name, sizeof(u->name), "%s", field[0]);
+            snprintf(u->pass, sizeof(u->pass), "%s", field[1]);
+        }
+        trim(u->name);
+        trim(u->pass);
+
+        if (u->id < 1 || u->id > MAX_USERS)
+            u->id = (uint8_t)next_id;
+        if (u->priv < 1 || u->priv > 5)
+            u->priv = 4;
+        /* a user may exist without a password yet (provisioning order is
+         * name first, password second), but a record without a name is useless */
+        if (!u->name[0])
             continue;
-        if (strlen(colon + 1) == 0 || strlen(colon + 1) > 20)
-            continue;
-        snprintf(g_users[g_nusers].name, sizeof(g_users[0].name), "%s", line);
-        snprintf(g_users[g_nusers].pass, sizeof(g_users[0].pass), "%s", colon + 1);
+        if (u->id >= next_id)
+            next_id = u->id + 1;
         g_nusers++;
     }
     fclose(f);
     logmsg("loaded %d ipmi user(s) from %s", g_nusers, PASSWD_FILE);
 }
 
-static const char *user_password(const char *name)
+static void save_users(void)
+{
+    FILE *f;
+    int i;
+    const char *tmp = PASSWD_FILE ".new";
+
+    /* write-then-rename: a power cut in the middle must not leave a truncated
+     * user database behind */
+    f = fopen(tmp, "w");
+    if (!f) {
+        logmsg("cannot rewrite %s: %s", PASSWD_FILE, strerror(errno));
+        return;
+    }
+    fprintf(f, "# IPMI users: id:name:password:max-privilege:enabled\n"
+               "# privilege 1=callback 2=user 3=operator 4=administrator 5=OEM\n");
+    for (i = 0; i < g_nusers; i++)
+        fprintf(f, "%u:%s:%s:%u:%u\n", g_users[i].id, g_users[i].name,
+                g_users[i].pass, g_users[i].priv, g_users[i].enabled);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    chmod(tmp, 0600);
+    if (rename(tmp, PASSWD_FILE) != 0) {
+        logmsg("cannot replace %s: %s", PASSWD_FILE, strerror(errno));
+        remove(tmp);
+    }
+    sync();
+}
+
+static ipmi_user_t *user_by_id(uint8_t id)
 {
     int i;
     for (i = 0; i < g_nusers; i++)
-        if (strcmp(g_users[i].name, name) == 0)
-            return g_users[i].pass;
+        if (g_users[i].id == id)
+            return &g_users[i];
     return NULL;
+}
+
+static ipmi_user_t *user_by_name(const char *name)
+{
+    int i;
+    if (name == NULL || name[0] == '\0')
+        return NULL;
+    for (i = 0; i < g_nusers; i++)
+        if (strcmp(g_users[i].name, name) == 0)
+            return &g_users[i];
+    return NULL;
+}
+
+/* Return the record for an IPMI user id, creating an empty slot when asked to.
+ * Real BMCs let a client configure any user id, so "Set User Name 3" has to
+ * work on a slot that has never been used. */
+static ipmi_user_t *user_slot(uint8_t id, int create)
+{
+    ipmi_user_t *u = user_by_id(id);
+
+    if (u || !create || g_nusers >= MAX_USERS || id < 1 || id > MAX_USERS)
+        return u;
+    u = &g_users[g_nusers];
+    memset(u, 0, sizeof(*u));
+    u->id = id;
+    u->priv = 1;
+    u->enabled = 1;
+    g_nusers++;
+    return u;
+}
+
+static const char *user_password(const char *name)
+{
+    ipmi_user_t *u = user_by_name(name);
+    /* an account without a password must not authenticate: RAKP would happily
+     * derive keys from the empty string */
+    if (u == NULL || !u->enabled || u->pass[0] == '\0')
+        return NULL;
+    return u->pass;
 }
 
 /* ------------------------------------------------------------ power glue */
@@ -666,6 +803,137 @@ static void sdr_build(void)
     }
 }
 
+/* ------------------------------------------------------- user SDR records */
+/*
+ * The sensor records above are derived from /dev/i2c-* and sysfs on every
+ * start, so they cannot be written back -- there is nothing to write them to.
+ * What a BMC is still expected to provide is a repository the *host* can add
+ * its own records to (Add/Partial Add/Delete/Clear SDR).  Those live in
+ * /config and are served after the generated records, with record IDs from
+ * 0x0100 up so the two ranges can never collide.
+ */
+#define SDR_USER_CONF  "/config/ipmi-sdr-user.conf"
+#define SDR_USER_MAX   32
+#define SDR_REC_MAX    255
+#define SDR_USER_ID0   0x0100
+
+static uint8_t  g_usdr[SDR_USER_MAX][SDR_REC_MAX];
+static uint16_t g_usdr_len[SDR_USER_MAX];
+static int      g_nusdr;
+static uint32_t g_sdr_add_ts, g_sdr_erase_ts;
+
+/* staging area for Partial Add SDR, which arrives in pieces */
+static uint8_t  g_sdr_stage[SDR_REC_MAX];
+static int      g_sdr_stage_len, g_sdr_stage_off;
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void sdr_user_load(void)
+{
+    char line[SDR_REC_MAX * 2 + 16];
+    FILE *f = fopen(SDR_USER_CONF, "r");
+
+    g_nusdr = 0;
+    g_sdr_add_ts = g_sdr_erase_ts = 0;
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL && g_nusdr < SDR_USER_MAX) {
+        char *p = line;
+        int n = 0;
+
+        if (sscanf(line, "#ts %u %u", &g_sdr_add_ts, &g_sdr_erase_ts) == 2)
+            continue;
+        while (n < SDR_REC_MAX) {
+            int hi = hexval((unsigned char)p[0]), lo;
+            if (hi < 0)
+                break;
+            lo = hexval((unsigned char)p[1]);
+            if (lo < 0)
+                break;
+            g_usdr[g_nusdr][n++] = (uint8_t)((hi << 4) | lo);
+            p += 2;
+        }
+        if (n >= 5)
+            g_usdr_len[g_nusdr++] = (uint16_t)n;
+    }
+    fclose(f);
+}
+
+static void sdr_user_save(void)
+{
+    char tmp[128];
+    FILE *f;
+    int i, k;
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", SDR_USER_CONF);
+    f = fopen(tmp, "w");
+    if (f == NULL)
+        return;
+    fprintf(f, "#ts %u %u\n", g_sdr_add_ts, g_sdr_erase_ts);
+    for (i = 0; i < g_nusdr; i++) {
+        for (k = 0; k < g_usdr_len[i]; k++)
+            fprintf(f, "%02x", g_usdr[i][k]);
+        fputc('\n', f);
+    }
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    chmod(tmp, 0600);
+    if (rename(tmp, SDR_USER_CONF) != 0) {
+        logmsg("cannot replace %s: %s", SDR_USER_CONF, strerror(errno));
+        remove(tmp);
+    }
+}
+
+static int sdr_rec_count(void)
+{
+    return g_nsensors + g_nusdr;
+}
+
+/* 0-based index -> record id */
+static uint16_t sdr_id_of(int idx)
+{
+    return (uint16_t)(idx < g_nsensors ? idx + 1 : SDR_USER_ID0 + (idx - g_nsensors));
+}
+
+/* record id -> 0-based index, -1 when absent */
+static int sdr_idx_of(uint16_t rid)
+{
+    if (rid >= 1 && rid <= g_nsensors)
+        return (int)rid - 1;
+    if (rid >= SDR_USER_ID0 && rid < SDR_USER_ID0 + g_nusdr)
+        return g_nsensors + (int)(rid - SDR_USER_ID0);
+    return -1;
+}
+
+static const uint8_t *sdr_rec_of(int idx, int *len)
+{
+    if (idx < g_nsensors) {
+        *len = g_sdr_len[idx];
+        return g_sdr_blob + g_sdr_off[idx];
+    }
+    idx -= g_nsensors;
+    if (idx < 0 || idx >= g_nusdr)
+        return NULL;
+    *len = g_usdr_len[idx];
+    return g_usdr[idx];
+}
+
+static int sdr_user_add(const uint8_t *rec, int len)
+{
+    if (len < 5 || len > SDR_REC_MAX || g_nusdr >= SDR_USER_MAX)
+        return -1;
+    memcpy(g_usdr[g_nusdr], rec, (size_t)len);
+    g_usdr_len[g_nusdr] = (uint16_t)len;
+    return g_nusdr++;
+}
+
 /* vendor slots are 20 bytes; IPMI wants standard 16-byte records */
 static int sel_load(uint8_t *out, int maxrec)
 {
@@ -763,7 +1031,7 @@ static void tlv_str(const uint8_t *buf, int totlen, uint8_t type,
 /* "MM/DD/YYYY hh:mm:ss" -> minutes since 1996-01-01, IPMI board mfg date */
 static int32_t fru_date_minutes(const char *s)
 {
-    int mo = 0, dy = 0, yy = 0, hh = 0, mi = 0, i;
+    int mo = 0, dy = 0, yy = 0, hh = 0, mi = 0;
     int32_t days;
     static const int mdays[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
 
@@ -774,7 +1042,6 @@ static int32_t fru_date_minutes(const char *s)
     days = (yy - 1996) * 365 + (yy - 1996 + 3) / 4 + mdays[mo - 1] + (dy - 1);
     if (mo > 2 && ((yy % 4) == 0))
         days++;
-    (void)i;
     return days * 1440 + hh * 60 + mi;
 }
 
@@ -1247,6 +1514,639 @@ static int conf_lookup(const char *file, const char *key, char *out,
     return -1;
 }
 
+/*
+ * Write a single "<key>,<value>" line of the mgmtd configuration tree and
+ * refresh the checksum next to it.  is_mgmtd validates /config/is_mgmtd.conf
+ * with `sha1sum -c` at startup and rolls the file back when it does not match,
+ * so the two always have to be updated together.
+ */
+static int conf_set_line(const char *key, const char *val)
+{
+    FILE *in, *out;
+    char line[512], want[512];
+    const char *tmp = MGMTD_CONF ".new";
+    size_t klen = strlen(key);
+    int found = 0;
+
+    snprintf(want, sizeof(want), "%s,", key);
+    in = fopen(MGMTD_CONF, "r");
+    if (in == NULL)
+        return -1;
+    out = fopen(tmp, "w");
+    if (out == NULL) {
+        fclose(in);
+        return -1;
+    }
+    while (fgets(line, sizeof(line), in) != NULL) {
+        if (strncmp(line, want, klen + 1) == 0) {
+            fprintf(out, "%s,%s\n", key, val);
+            found = 1;
+            continue;
+        }
+        fputs(line, out);
+    }
+    fclose(in);
+    fclose(out);
+    if (!found || rename(tmp, MGMTD_CONF) != 0) {
+        remove(tmp);
+        logmsg("conf_set_line: %s not found, nothing written", key);
+        return -1;
+    }
+    return 0;
+}
+
+static void conf_rehash(void)
+{
+    char hash[128] = "";
+    FILE *p, *f;
+
+    p = popen("sha1sum " MGMTD_CONF " 2>/dev/null", "r");
+    if (p == NULL)
+        return;
+    if (fgets(hash, sizeof(hash), p) != NULL) {
+        char *sp = strchr(hash, ' ');
+        if (sp != NULL)
+            *sp = '\0';
+    }
+    pclose(p);
+    if (hash[0] == '\0')
+        return;
+
+    f = fopen(MGMTD_CONF ".sha1sum", "w");
+    if (f == NULL)
+        return;
+    fprintf(f, "%s  %s\n", hash, MGMTD_CONF);
+    fclose(f);
+}
+
+/* ---------------------------------------------------------------- PEF */
+/*
+ * Platform Event Filtering, configuration side only.
+ *
+ * Nothing acts on a filter yet -- the vendor's SEL reader owns event
+ * generation -- so this keeps the settings a management tool can read and
+ * write and reports that no filter or alert policy table exists.  A PET
+ * sender (SNMPv1 trap to the configured LAN alert destinations) is the piece
+ * still missing before PEF can push anything out.
+ */
+#define PEF_CONF "/config/ipmi-pef.conf"
+
+typedef struct {
+    uint8_t global;         /* action global control */
+    uint8_t percontrol;     /* action per-control  */
+    uint8_t startup;        /* startup delay, 100 ms units */
+    uint8_t alert_startup;  /* alert startup delay */
+} pef_cfg_t;
+
+static pef_cfg_t g_pef = { 0x01, 0x01, 0x00, 0x00 };
+
+static void pef_load(void)
+{
+    char line[128];
+    FILE *f = fopen(PEF_CONF, "r");
+
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned v;
+        if (sscanf(line, "global=%u", &v) == 1)             g_pef.global = (uint8_t)v;
+        else if (sscanf(line, "percontrol=%u", &v) == 1)    g_pef.percontrol = (uint8_t)v;
+        else if (sscanf(line, "startup=%u", &v) == 1)        g_pef.startup = (uint8_t)v;
+        else if (sscanf(line, "alert_startup=%u", &v) == 1)  g_pef.alert_startup = (uint8_t)v;
+    }
+    fclose(f);
+}
+
+static void pef_save(void)
+{
+    FILE *f = fopen(PEF_CONF, "w");
+
+    if (f == NULL) {
+        logmsg("cannot write %s: %s", PEF_CONF, strerror(errno));
+        return;
+    }
+    fprintf(f, "global=%u\npercontrol=%u\nstartup=%u\nalert_startup=%u\n",
+            g_pef.global, g_pef.percontrol, g_pef.startup, g_pef.alert_startup);
+    fclose(f);
+}
+
+/* ------------------------------------------------- LAN alert destinations */
+/*
+ * The four "alert destination" LAN parameters (17 number, 18 type, 19 address)
+ * are what an IPMI management tool writes when it wants the BMC to notify
+ * something.  They are stored in one small text file; the PET sender below is
+ * the only consumer.
+ */
+#define ALERT_CONF "/config/ipmi-lan-alert.conf"
+#define ALERT_MAX  4
+
+typedef struct {
+    uint8_t       enabled;
+    uint8_t       type;         /* 0 none, 1 PET, ... (we only send PET) */
+    uint8_t       ack_timeout;  /* seconds per retry */
+    uint8_t       retries;
+    uint8_t       addr_format;  /* 0 = IPv4 */
+    struct in_addr ip;
+} alert_dest_t;
+
+static alert_dest_t g_alert[ALERT_MAX];
+
+static void alert_load(void)
+{
+    char line[160];
+    FILE *f = fopen(ALERT_CONF, "r");
+
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned idx, en, type, ack, ret, fmt, a, b, c, d;
+        if (sscanf(line, "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+                   &idx, &en, &type, &ack, &ret, &fmt, &a, &b, &c, &d) != 10)
+            continue;
+        if (idx < 1 || idx > ALERT_MAX)
+            continue;
+        g_alert[idx - 1].enabled     = (uint8_t)en;
+        g_alert[idx - 1].type        = (uint8_t)type;
+        g_alert[idx - 1].ack_timeout = (uint8_t)ack;
+        g_alert[idx - 1].retries     = (uint8_t)ret;
+        g_alert[idx - 1].addr_format = (uint8_t)fmt;
+        g_alert[idx - 1].ip.s_addr =
+            htonl(((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                  ((uint32_t)c << 8) | (uint32_t)d);
+    }
+    fclose(f);
+}
+
+static void alert_save(void)
+{
+    FILE *f = fopen(ALERT_CONF, "w");
+    int i;
+
+    if (f == NULL)
+        return;
+    for (i = 0; i < ALERT_MAX; i++) {
+        uint32_t h = ntohl(g_alert[i].ip.s_addr);
+        fprintf(f, "%d:%u:%u:%u:%u:%u:%u:%u:%u:%u\n",
+                i + 1, g_alert[i].enabled, g_alert[i].type,
+                g_alert[i].ack_timeout, g_alert[i].retries,
+                g_alert[i].addr_format,
+                (h >> 24) & 0xff, (h >> 16) & 0xff, (h >> 8) & 0xff, h & 0xff);
+    }
+    fclose(f);
+    chmod(ALERT_CONF, 0600);
+}
+
+static int alert_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < ALERT_MAX; i++)
+        if (g_alert[i].enabled && g_alert[i].ip.s_addr != 0)
+            n++;
+    return n;
+}
+
+/* ------------------------------------------------------------ PET sender */
+/*
+ * A Platform Event Trap, i.e. an SNMPv1 trap carrying the PET varbinds.
+ * Only the fields a trap receiver actually needs are filled in; the OIDs are
+ * the ones defined by the IPMI PET specification (enterprise 3183).
+ */
+#define PET_ENTERPRISE_OID  "1.3.6.1.4.1.3183"
+
+static int ber_put(uint8_t *out, int *pos, uint8_t tag, const uint8_t *val,
+                   int len)
+{
+    int n = 1;
+
+    if (len < 0x80) {
+        out[pos[0]++] = tag;
+        out[pos[0]++] = (uint8_t)len;
+    } else if (len < 0x100) {
+        out[pos[0]++] = tag;
+        out[pos[0]++] = 0x81;
+        out[pos[0]++] = (uint8_t)len;
+        n = 2;
+    } else {
+        out[pos[0]++] = tag;
+        out[pos[0]++] = 0x82;
+        out[pos[0]++] = (uint8_t)(len >> 8);
+        out[pos[0]++] = (uint8_t)(len & 0xff);
+        n = 3;
+    }
+    if (val != NULL) {
+        memcpy(out + pos[0], val, (size_t)len);
+        pos[0] += len;
+    }
+    return n + len;
+}
+
+
+static int ber_int(uint8_t *out, int *pos, int32_t v)
+{
+    uint8_t b[4];
+    int n = 0;
+
+    if (v < 0 || v > 0x7fffffff) {
+        b[0] = (uint8_t)((v >> 24) & 0xff);
+        b[1] = (uint8_t)((v >> 16) & 0xff);
+        b[2] = (uint8_t)((v >> 8) & 0xff);
+        b[3] = (uint8_t)(v & 0xff);
+        if (b[0] & 0x80) {                   /* keep it positive */
+            uint8_t c[5] = { 0, b[0], b[1], b[2], b[3] };
+            return ber_put(out, pos, 0x02, c, 5);
+        }
+        return ber_put(out, pos, 0x02, b, 4);
+    }
+    do {
+        b[3 - n] = (uint8_t)(v & 0xff);
+        v >>= 8;
+        n++;
+    } while (v > 0 && n < 4);
+    return ber_put(out, pos, 0x02, b + 4 - n, n);
+}
+
+static int oid_encode(const uint32_t *arcs, int narcs, uint8_t *out)
+{
+    uint32_t vals[24];
+    int nvals = 0, len = 0, i;
+
+    /* the first two arcs share one sub-identifier */
+    vals[nvals++] = arcs[0] * 40 + arcs[1];
+    for (i = 2; i < narcs && nvals < (int)(sizeof(vals) / sizeof(vals[0])); i++)
+        vals[nvals++] = arcs[i];
+
+    for (i = 0; i < nvals; i++) {
+        uint8_t tmp[5];
+        int n = 0, k;
+        uint32_t v = vals[i];
+
+        do {
+            tmp[n++] = (uint8_t)(v & 0x7f);
+            v >>= 7;
+        } while (v > 0 && n < 5);
+
+        /* emit most significant group first; every group except the last
+         * carries the continuation bit */
+        for (k = n - 1; k >= 0; k--) {
+            uint8_t b = tmp[k];
+            if (k != 0)
+                b |= 0x80;
+            out[len++] = b;
+        }
+    }
+    return len;
+}
+
+static int ber_oid(uint8_t *out, int *pos, const uint32_t *arcs, int narcs)
+{
+    uint8_t enc[64];
+    int n = oid_encode(arcs, narcs, enc);
+    return ber_put(out, pos, 0x06, enc, n);
+}
+
+/* one varbind: SEQUENCE { OID, value } */
+static int ber_varbind_string(uint8_t *out, int *pos, const uint32_t *arcs,
+                              int narcs, const char *s)
+{
+    uint8_t body[512];
+    int b = 0;
+
+    ber_oid(body, &b, arcs, narcs);
+    ber_put(body, &b, 0x04, (const uint8_t *)s, (int)strlen(s));
+    return ber_put(out, pos, 0x30, body, b);
+}
+
+/* value is a byte string of known length, not NUL terminated */
+static int ber_varbind_octets(uint8_t *out, int *pos, const uint32_t *arcs,
+                              int narcs, const uint8_t *s, int len)
+{
+    uint8_t body[512];
+    int b = 0;
+
+    ber_oid(body, &b, arcs, narcs);
+    ber_put(body, &b, 0x04, s, len);
+    return ber_put(out, pos, 0x30, body, b);
+}
+
+/* value is an OBJECT IDENTIFIER, as snmpTrapOID.0 requires */
+static int ber_varbind_oid(uint8_t *out, int *pos, const uint32_t *arcs,
+                           int narcs, const uint32_t *val, int nval)
+{
+    uint8_t body[256];
+    int b = 0;
+
+    ber_oid(body, &b, arcs, narcs);
+    ber_oid(body, &b, val, nval);
+    return ber_put(out, pos, 0x30, body, b);
+}
+
+static int ber_varbind_int(uint8_t *out, int *pos, const uint32_t *arcs,
+                           int narcs, int32_t v)
+{
+    uint8_t body[128];
+    int b = 0;
+
+    ber_oid(body, &b, arcs, narcs);
+    ber_int(body, &b, v);
+    return ber_put(out, pos, 0x30, body, b);
+}
+
+static int ber_varbind_timeticks(uint8_t *out, int *pos, const uint32_t *arcs,
+                                 int narcs, uint32_t v)
+{
+    uint8_t body[128], num[4];
+    int b = 0;
+
+    num[0] = (uint8_t)(v >> 24);
+    num[1] = (uint8_t)(v >> 16);
+    num[2] = (uint8_t)(v >> 8);
+    num[3] = (uint8_t)v;
+    ber_oid(body, &b, arcs, narcs);
+    ber_put(body, &b, 0x43, num, 4);         /* Timeticks */
+    return ber_put(out, pos, 0x30, body, b);
+}
+
+/* sysUpTime.0 and snmpTrapOID.0 */
+static const uint32_t OID_SYSUPTIME[]  = { 1,3,6,1,2,1,1,3,0 };
+static const uint32_t OID_TRAPOID[]    = { 1,3,6,1,6,3,1,1,4,1,0 };
+static const uint32_t OID_PET_TRAP[]   = { 1,3,6,1,4,1,3183,1,1,1 };          /* petTrap */
+static const uint32_t OID_PET_HOSTNAME[] = { 1,3,6,1,4,1,3183,1,1,1,2,0 };
+static const uint32_t OID_PET_DATETIME[] = { 1,3,6,1,4,1,3183,1,1,1,3,0 };
+static const uint32_t OID_PET_SEQ[]      = { 1,3,6,1,4,1,3183,1,1,1,4,0 };
+static const uint32_t OID_PET_EVTYPE[]   = { 1,3,6,1,4,1,3183,1,1,1,5,0 };
+static const uint32_t OID_PET_SRCTYPE[]  = { 1,3,6,1,4,1,3183,1,1,1,7,0 };
+static const uint32_t OID_PET_SEVERITY[] = { 1,3,6,1,4,1,3183,1,1,1,8,0 };
+static const uint32_t OID_PET_SENSTYPE[] = { 1,3,6,1,4,1,3183,1,1,1,9,0 };
+static const uint32_t OID_PET_SENSNUM[]  = { 1,3,6,1,4,1,3183,1,1,1,10,0 };
+static const uint32_t OID_PET_EVTDATA[]  = { 1,3,6,1,4,1,3183,1,1,1,11,0 };
+static const uint32_t OID_PET_DESC[]     = { 1,3,6,1,4,1,3183,1,1,1,14,0 };
+
+static uint32_t g_pet_seq;
+
+/* The management port is a slave of the vrf-pub VRF, so its routes live in
+ * table 300 and the main table has none at all.  A trap socket that is not
+ * bound to the VRF device therefore fails with ENETUNREACH -- the listener is
+ * bound for exactly this reason (see S47is_ipmi_lan). */
+static char g_bind_dev[IF_NAMESIZE];
+
+/* one SEL record (16 bytes in our internal form) -> PET trap */
+static void pet_send(const uint8_t *rec, int event_type)
+{
+    uint8_t pkt[1024], vbl[640], body[256], ent[64];
+    int p = 0, pb = 0, vb = 0, i;
+    char host[64] = "ubmc";
+    char when[32];
+    char desc[128];
+    uint32_t uptime = (uint32_t)(now_ms() / 10);     /* 10 ms units */
+    time_t ts = (time_t)rd_le32(rec + 3);
+    struct tm tmv;
+
+    for (i = 0; i < ALERT_MAX; i++) {
+        struct sockaddr_in to;
+        int one = 1, sock;
+
+        if (!g_alert[i].enabled || g_alert[i].ip.s_addr == 0 ||
+            g_alert[i].type != 1)
+            continue;
+
+        gethostname(host, sizeof(host));
+        localtime_r(&ts, &tmv);
+        snprintf(when, sizeof(when), "%02d%02d%02d%02d%02d%02d",
+                 tmv.tm_year % 100, tmv.tm_mon + 1, tmv.tm_mday,
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        snprintf(desc, sizeof(desc),
+                 "SEL %u: sensor type 0x%02x sensor %u event 0x%02x data %02x%02x%02x",
+                 (unsigned)rec[0], rec[10], rec[11], rec[12],
+                 rec[13], rec[14], rec[15]);
+
+        vb = 0;
+        ber_varbind_timeticks(vbl, &vb, OID_SYSUPTIME,
+                             (int)(sizeof(OID_SYSUPTIME) / 4), uptime);
+        ber_varbind_oid(vbl, &vb, OID_TRAPOID,
+                        (int)(sizeof(OID_TRAPOID) / 4),
+                        OID_PET_TRAP, (int)(sizeof(OID_PET_TRAP) / 4));
+        ber_varbind_string(vbl, &vb, OID_PET_HOSTNAME,
+                           (int)(sizeof(OID_PET_HOSTNAME) / 4), host);
+        ber_varbind_string(vbl, &vb, OID_PET_DATETIME,
+                           (int)(sizeof(OID_PET_DATETIME) / 4), when);
+        ber_varbind_int(vbl, &vb, OID_PET_SEQ,
+                        (int)(sizeof(OID_PET_SEQ) / 4), (int32_t)++g_pet_seq);
+        ber_varbind_int(vbl, &vb, OID_PET_EVTYPE,
+                        (int)(sizeof(OID_PET_EVTYPE) / 4), event_type);
+        ber_varbind_int(vbl, &vb, OID_PET_SRCTYPE,
+                        (int)(sizeof(OID_PET_SRCTYPE) / 4), 1);      /* IPMI SEL */
+        ber_varbind_string(vbl, &vb, OID_PET_SEVERITY,
+                           (int)(sizeof(OID_PET_SEVERITY) / 4), "information");
+        ber_varbind_int(vbl, &vb, OID_PET_SENSTYPE,
+                        (int)(sizeof(OID_PET_SENSTYPE) / 4), rec[10]);
+        ber_varbind_int(vbl, &vb, OID_PET_SENSNUM,
+                        (int)(sizeof(OID_PET_SENSNUM) / 4), rec[11]);
+        {
+            uint8_t d[3];
+            d[0] = rec[13];
+            d[1] = rec[14];
+            d[2] = rec[15];
+            ber_varbind_octets(vbl, &vb, OID_PET_EVTDATA,
+                               (int)(sizeof(OID_PET_EVTDATA) / 4), d, 3);
+        }
+        ber_varbind_string(vbl, &vb, OID_PET_DESC,
+                           (int)(sizeof(OID_PET_DESC) / 4), desc);
+
+        /* trap PDU: enterprise, agent-addr, generic, specific, timeticks,
+         * varbinds */
+        pb = 0;
+        {
+            uint32_t arcs[] = { 1,3,6,1,4,1,3183 };
+            int n = oid_encode(arcs, 6, ent);
+            ber_put(body, &pb, 0x06, ent, n);
+        }
+        {
+            uint8_t ipb[4] = { 0, 0, 0, 0 };
+            ber_put(body, &pb, 0x40, ipb, 4);       /* agent-addr */
+        }        ber_int(body, &pb, 6);                      /* generic-trap: enterprise */
+        ber_int(body, &pb, 1);                      /* specific-trap: PET */
+        {
+            uint8_t tb[4];
+            tb[0] = (uint8_t)(uptime >> 24);
+            tb[1] = (uint8_t)(uptime >> 16);
+            tb[2] = (uint8_t)(uptime >> 8);
+            tb[3] = (uint8_t)uptime;
+            ber_put(body, &pb, 0x43, tb, 4);        /* time-stamp */
+        }
+        ber_put(body, &pb, 0x30, vbl, vb);          /* varbind list */
+        {
+            uint8_t pdu[768];
+            uint8_t inner[896];
+            int pp = 0, ib = 0, pl = 0;
+
+            ber_put(pdu, &pp, 0xA4, body, pb);      /* [4] trap PDU */
+            ber_int(inner, &ib, 0);                 /* version: SNMPv1 */
+            ber_put(inner, &ib, 0x04, (const uint8_t *)g_lan.community,
+                      (int)strlen(g_lan.community));
+            memcpy(inner + ib, pdu, (size_t)pp);
+            ib += pp;
+            ber_put(pkt, &pl, 0x30, inner, ib);     /* outer SEQUENCE */
+            p = pl;
+        }
+
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+            continue;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (g_bind_dev[0] != '\0' &&
+            setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                       g_bind_dev, (socklen_t)(strlen(g_bind_dev) + 1)) != 0)
+            logmsg("pet: cannot bind to %s: %s", g_bind_dev, strerror(errno));
+        memset(&to, 0, sizeof(to));
+        to.sin_family = AF_INET;
+        to.sin_port = htons(162);
+        to.sin_addr = g_alert[i].ip;
+        if (sendto(sock, pkt, (size_t)p, 0,
+                   (struct sockaddr *)&to, sizeof(to)) < 0)
+            logmsg("pet: send to %s failed: %s",
+                   inet_ntoa(g_alert[i].ip), strerror(errno));
+        else
+            logmsg("pet: sent %d bytes to %s:162", p, inet_ntoa(g_alert[i].ip));
+        close(sock);
+    }
+}
+
+/* --------------------------------------------------- SEL -> PEF actions */
+/*
+ * The SEL is a flat file the vendor daemon writes, pre-allocated so that every
+ * 20-byte slot already looks like a valid record.  Counting records therefore
+ * never changes, so "is there something new" has to be decided on the
+ * timestamp of the newest record instead.
+ */
+static uint32_t g_sel_last_ts;
+static int      g_sel_primed;
+
+static void pef_event(const uint8_t *rec)
+{
+    char desc[160];
+
+    snprintf(desc, sizeof(desc),
+             "SEL event id %u: sensor type 0x%02x, sensor %u, "
+             "event 0x%02x, data %02x %02x %02x",
+             (unsigned)rec[0], rec[10], rec[11], rec[12],
+             rec[13], rec[14], rec[15]);
+
+    syslog(LOG_WARNING, "%s", desc);
+    logmsg("pef: %s", desc);
+
+    if (!(g_pef.global & 0x01)) {           /* alert action disabled */
+        logmsg("pef: alert action disabled, not sending a trap");
+        return;
+    }
+    if (alert_count() == 0) {
+        logmsg("pef: no alert destination configured");
+        return;
+    }
+    pet_send(rec, 2);                       /* 2 = event */
+}
+
+/* Called from the idle tick.  stat() first: re-parsing the SEL out of the eMMC
+ * every second is enough I/O to stall the select loop and make clients
+ * retransmit (which shows up as duplicated RAKP4). */
+static void pef_poll(void)
+{
+    static uint8_t recs[SEL_MAX * 16];
+    static time_t last_mtime;
+    static off_t  last_size;
+    struct stat st;
+    int n, i, fired = 0;
+    uint32_t newest = 0;
+
+    if (stat(SEL_FILE, &st) != 0)
+        return;
+    if (st.st_mtime == last_mtime && st.st_size == last_size)
+        return;                             /* nothing written since last look */
+    last_mtime = st.st_mtime;
+    last_size  = st.st_size;
+
+    n = sel_load(recs, SEL_MAX);
+    if (n <= 0)
+        return;
+    for (i = 0; i < n; i++) {
+        uint32_t ts = rd_le32(recs + i * 16 + 3);
+        if (ts > newest)
+            newest = ts;
+    }
+    if (!g_sel_primed) {                    /* first poll: adopt what is there */
+        g_sel_primed = 1;
+        g_sel_last_ts = newest;
+        return;
+    }
+    if (newest <= g_sel_last_ts)
+        return;
+
+    for (i = 0; i < n && fired < 16; i++) {
+        uint32_t ts = rd_le32(recs + i * 16 + 3);
+        if (ts > g_sel_last_ts) {
+            pef_event(recs + i * 16);
+            fired++;
+        }
+    }
+    g_sel_last_ts = newest;
+}
+
+static void lanparams_load(void)
+{
+    char line[160];
+    FILE *f = fopen(LANPARAM_CONF, "r");
+
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned a, b, c, d, e;
+        char com[18];
+        if (sscanf(line, "community=%17s", com) == 1) {
+            snprintf(g_lan.community, sizeof(g_lan.community), "%s", com);
+        } else if (sscanf(line, "auth_types=%u", &a) == 1) {
+            g_lan.auth_types = (uint8_t)a;
+        } else if (sscanf(line, "auth_enables=%u,%u,%u,%u,%u",
+                          &a, &b, &c, &d, &e) == 5) {
+            g_lan.auth_enables[0] = (uint8_t)a;
+            g_lan.auth_enables[1] = (uint8_t)b;
+            g_lan.auth_enables[2] = (uint8_t)c;
+            g_lan.auth_enables[3] = (uint8_t)d;
+            g_lan.auth_enables[4] = (uint8_t)e;
+        } else if (sscanf(line, "arp_control=%u", &a) == 1) {
+            g_lan.arp_control = (uint8_t)a;
+        } else if (sscanf(line, "garp_interval=%u", &a) == 1) {
+            g_lan.garp_interval = (uint8_t)a;
+        }
+    }
+    fclose(f);
+}
+
+static void lanparams_save(void)
+{
+    char tmp[128];
+    FILE *f;
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", LANPARAM_CONF);
+    f = fopen(tmp, "w");
+    if (f == NULL)
+        return;
+    fprintf(f, "community=%s\n", g_lan.community);
+    fprintf(f, "auth_types=%u\n", g_lan.auth_types);
+    fprintf(f, "auth_enables=%u,%u,%u,%u,%u\n",
+            g_lan.auth_enables[0], g_lan.auth_enables[1],
+            g_lan.auth_enables[2], g_lan.auth_enables[3],
+            g_lan.auth_enables[4]);
+    fprintf(f, "arp_control=%u\ngarp_interval=%u\n",
+            g_lan.arp_control, g_lan.garp_interval);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    chmod(tmp, 0600);
+    if (rename(tmp, LANPARAM_CONF) != 0) {
+        logmsg("cannot replace %s: %s", LANPARAM_CONF, strerror(errno));
+        remove(tmp);
+    }
+}
+
 /* IPMI "IP Address Source": 0 unspecified, 1 static, 2 DHCP */
 static int iface_ipv4_origin(const char *name)
 {
@@ -1298,7 +2198,7 @@ static int iface_ipv4_origin(const char *name)
 #define LANP_RMCP_PLUS_PRIVS     24
 
 /* build the parameter data; returns its length, or -1 when not supported */
-static int lan_param(uint8_t *out, int max, uint8_t sel)
+static int lan_param(uint8_t *out, int max, uint8_t sel, uint8_t arg)
 {
     char ifname[IF_NAMESIZE];
     struct in_addr ip, mask, gw;
@@ -1320,10 +2220,10 @@ static int lan_param(uint8_t *out, int max, uint8_t sel)
         out[len++] = 0x00;
         break;
     case LANP_AUTH_TYPE_SUPPORT:
-        out[len++] = 0x15;          /* none + MD2 + MD5 + password */
+        out[len++] = g_lan.auth_types;
         break;
     case LANP_AUTH_TYPE_ENABLE:
-        memset(out + len, 0x15, 5); /* callback, user, operator, admin, OEM */
+        memcpy(out + len, g_lan.auth_enables, 5);
         len += 5;
         break;
     case LANP_IP_ADDRESS:
@@ -1355,13 +2255,27 @@ static int lan_param(uint8_t *out, int max, uint8_t sel)
         out[len++] = 0x02;
         break;
     case LANP_BMC_ARP_CONTROL:
-    case LANP_GRATUITOUS_ARP:
-        out[len++] = 0x00;
+        out[len++] = g_lan.arp_control;
         break;
-    case LANP_DEFAULT_GATEWAY:
+    case LANP_GRATUITOUS_ARP:
+        out[len++] = g_lan.garp_interval;
+        break;
+    case LANP_DEFAULT_GATEWAY: {
+        /* prefer the configuration tree: this is where a Set LAN Config write
+         * puts the value, and /proc/net/route only ever shows the main table,
+         * never the VRF table the management port actually routes through */
+        char val[32];
+        gw.s_addr = 0;
+        if (conf_lookup(MGMTD_CONF, "/config/system/mgmt/default-gateway",
+                        val, sizeof(val)) == 0) {
+            struct in_addr conf_gw;
+            if (inet_aton(val, &conf_gw) != 0)
+                gw = conf_gw;
+        }
         memcpy(out + len, &gw.s_addr, 4);
         len += 4;
         break;
+    }
     case LANP_BACKUP_GATEWAY:
         memset(out + len, 0, 4);
         len += 4;
@@ -1372,17 +2286,46 @@ static int lan_param(uint8_t *out, int max, uint8_t sel)
         len += 6;
         break;
     case LANP_COMMUNITY_STRING:
-        memset(out + len, 0, 18);   /* SNMP community, fixed length */
-        memcpy(out + len, "public", 6);
+        /* fixed 18 bytes, NUL padded; this is the community PET uses */
+        memset(out + len, 0, 18);
+        memcpy(out + len, g_lan.community, strlen(g_lan.community));
         len += 18;
         break;
     case LANP_NUM_DESTINATIONS:
-        out[len++] = 0x00;
+        out[len++] = (uint8_t)alert_count();
         break;
-    case LANP_8021Q_VLAN_ID:
-        out[len++] = 0x00;          /* no VLAN tag on the management port */
-        out[len++] = 0x00;
+    case 18:                                    /* Alert Destination Type */
+    case 19: {                                  /* Alert Destination Address */
+        /* both are per-destination: `arg` is the destination selector that
+         * followed the parameter selector in the request */
+        const alert_dest_t *d;
+        if (arg < 1 || arg > ALERT_MAX) {
+            return -1;
+        }
+        d = &g_alert[arg - 1];
+        out[len++] = arg;                       /* echo the selector */
+        if (sel == 18) {
+            out[len++] = d->type;
+            out[len++] = (uint8_t)((d->ack_timeout & 0x3f) |
+                                   ((d->retries & 0x03) << 6));
+            out[len++] = d->addr_format;
+        } else {
+            memcpy(out + len, &d->ip.s_addr, 4);
+            len += 4;
+        }
         break;
+    }
+    case LANP_8021Q_VLAN_ID: {
+        char key[192], val[32];
+        unsigned vlan = 0;
+        snprintf(key, sizeof(key),
+                 "/config/system/mgmt/interface-list/%s/vlan", ifname);
+        if (conf_lookup(MGMTD_CONF, key, val, sizeof(val)) == 0)
+            vlan = (unsigned)strtoul(val, NULL, 10);
+        out[len++] = (uint8_t)(vlan & 0xff);
+        out[len++] = (uint8_t)((vlan >> 8) & 0xff);
+        break;
+    }
     case LANP_8021Q_VLAN_PRIORITY:
         out[len++] = 0x00;
         break;
@@ -1482,13 +2425,210 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             break;
         }
 
-        case 0x3B:                                  /* Set Session Priv Level */
+        case 0x41:                                  /* Get Channel Access */
+            /* Two data bytes only -- ipmitool rejects anything longer.
+             * byte 1: access mode 0x02 (always available) | 0x20 user level
+             *         auth | 0x10 per-message auth
+             * byte 2: channel privilege limit (4 = administrator) */
+            rsp[n++] = 0x32;
+            rsp[n++] = 0x04;
+            break;
+
+        case 0x40:                                  /* Set Channel Access */
+            /* accepted and ignored: there is no real ACL to change */
+            break;
+
+        case 0x54: {                                /* Get Channel Cipher Suites */
+            /* Standard records are four bytes: suite id, auth, integrity,
+             * crypt.  The list index counts *records*, and an index past the
+             * end must come back as an empty list -- returning 0xCC there is
+             * what makes ipmitool print "Unable to Get Channel Cipher
+             * Suites" on every single command. */
+            static const uint8_t suites[] = {
+                0x00, 0x00, 0x00, 0x00,   /* 0: none/none/none       */
+                0x01, 0x01, 0x01, 0x00,   /* 1: SHA1 / SHA1-96 / none */
+                0x03, 0x01, 0x01, 0x01,   /* 3: SHA1 / SHA1-96 / AES  */
+                0x11, 0x03, 0x04, 0x01,   /* 17: SHA256 / SHA256-128 / AES */
+                0x12, 0x03, 0x05, 0x01,   /* 18: SHA256 / SHA256-256 / AES */
+                0x13, 0x03, 0x00, 0x01,   /* 19: SHA256 / none / AES  */
+            };
+            uint8_t ch = (reqlen - 7) > 0 ? (uint8_t)(req[6] & 0x0f) : 1;
+            int     idx = (reqlen - 7) > 2 ? req[8] : 0;
+            int     nrec = (int)sizeof(suites) / 4;
+            int     from = idx * 16;            /* 16 records per response */
+            int     i;
+
+            rsp[n++] = ch;
+            for (i = from; i < nrec && i < from + 16; i++) {
+                memcpy(rsp + n, suites + i * 4, 4);
+                n += 4;
+            }
+            break;
+        }
+
+        case 0x44: {                                /* Get User Access */
+            uint8_t uid = (reqlen - 7) >= 2 ? (uint8_t)(req[7] & 0x3f) : 1;
+            ipmi_user_t *u = user_by_id(uid);
+            int enabled_count = 0, i;
+
+            if (uid < 1 || uid > MAX_USERS) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            for (i = 0; i < g_nusers; i++)
+                if (g_users[i].enabled)
+                    enabled_count++;
+
+            /* Layout as ipmitool reads it: byte 3 is where both the
+             * enable flags (bits 7:4) and the privilege limit (bits 3:0)
+             * live, which is why it prints "Channel Priv Limit: USER" when
+             * the privilege is put in byte 2 instead. */
+            rsp[n++] = MAX_USERS;                        /* max user ids */
+            rsp[n++] = (uint8_t)enabled_count;           /* enabled user ids */
+            rsp[n++] = 0x00;                             /* fixed user ids */
+            /* 0x20 link auth + 0x10 IPMI messaging; the callin bit (0x40)
+             * is active-low in ipmitool's display, so leave it clear */
+            rsp[n++] = (uint8_t)((u ? u->priv : 0) |
+                                 (u && u->enabled ? 0x30 : 0x00));
+            break;
+        }
+
+        case 0x43: {                                /* Set User Access */
+            uint8_t uid, priv;
+            ipmi_user_t *u;
+
+            if ((reqlen - 7) < 3) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            uid  = (uint8_t)(req[7] & 0x3f);
+            priv = (uint8_t)(req[8] & 0x0f);
+            if (uid < 1 || uid > MAX_USERS || priv < 1 || priv > 5) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            u = user_slot(uid, 1);
+            if (!u) {
+                rsp[6] = CC_INVALID_DATA;           /* all slots used */
+                break;
+            }
+            /* byte 3 carries the per-link permissions (callin / link auth /
+             * IPMI messaging), not the account enable bit -- that one is
+             * driven by Set User Password op 1/2.  We have no per-link ACLs,
+             * so only the privilege limit is stored. */
+            u->priv = priv;
+            save_users();
+            logmsg("user %u (%s): priv %u", uid, u->name, priv);
+            break;
+        }
+
+        case 0x46: {                                /* Get User Name */
+            /* ipmitool sends a single user-id byte; accept the two-byte
+             * channel+id form as well so other clients work too. */
+            uint8_t uid = (reqlen - 7) >= 2 ? (uint8_t)(req[7] & 0x3f)
+                        : (reqlen - 7) == 1 ? (uint8_t)(req[6] & 0x3f) : 0;
+            ipmi_user_t *u;
+            int i;
+
+            if (uid < 1 || uid > MAX_USERS) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            u = user_by_id(uid);
+            for (i = 0; i < 16; i++)
+                rsp[n++] = (u && i < (int)strlen(u->name)) ? (uint8_t)u->name[i] : 0x00;
+            break;
+        }
+
+        case 0x45: {                                /* Set User Name */
+            uint8_t uid = (reqlen - 7) >= 17 ? (uint8_t)(req[6] & 0x3f) : 0;
+            ipmi_user_t *u;
+            char name[17];
+            int i;
+
+            if (uid < 1 || uid > MAX_USERS || (reqlen - 7) < 16) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if ((u = user_slot(uid, 1)) == NULL) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            for (i = 0; i < 16; i++)
+                name[i] = (char)req[7 + i];
+            name[16] = '\0';
+            trim(name);
+            snprintf(u->name, sizeof(u->name), "%s", name);
+            save_users();
+            logmsg("user %u renamed to '%s'", uid, u->name);
+            break;
+        }
+
+        case 0x47: {                                /* Set User Password */
+            /* data: user id, operation, password
+             * operation 0 = disable user, 1 = enable user,
+             *           2 = set password, 3 = test password */
+            uint8_t uid = (reqlen - 7) >= 1 ? req[6] : 0;
+            uint8_t op  = (reqlen - 7) >= 2 ? req[7] : 0;
+            int     len = reqlen - 9;               /* minus uid, op and checksum */
+            ipmi_user_t *u;
+
+            if (uid < 1 || uid > MAX_USERS) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if ((u = user_slot(uid, 1)) == NULL) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (len > 20)
+                len = 20;
+            if (op == 2) {                          /* set password */
+                if (len < 1) {
+                    rsp[6] = CC_INVALID_DATA;
+                    break;
+                }
+                memset(u->pass, 0, sizeof(u->pass));
+                memcpy(u->pass, req + 8, (size_t)len);
+                save_users();
+                logmsg("user %u (%s): password updated", uid, u->name);
+            } else if (op == 1) {                   /* enable user */
+                u->enabled = 1;
+                save_users();
+                logmsg("user %u (%s): enabled", uid, u->name);
+            } else if (op == 0) {                   /* disable user */
+                u->enabled = 0;
+                save_users();
+                logmsg("user %u (%s): disabled", uid, u->name);
+            } else {                                /* op 3: test password */
+                if (len != (int)strlen(u->pass) ||
+                    memcmp(u->pass, req + 8, (size_t)len) != 0)
+                    rsp[6] = 0x80;                  /* password mismatch */
+            }
+            break;
+        }
+
+        case 0x3B:                                  /* Set Session Privilege Level */
             if ((reqlen - 7) < 1 || req[6] > 4) {
                 rsp[6] = CC_INVALID_DATA;
                 break;
             }
-            if (s)
+            if (s) {
+                /* an account may not raise itself above its configured maximum;
+                 * without this check a 3 (operator) account could simply ask for
+                 * 4 (administrator) and get it */
+                uint8_t limit = 4;
+                ipmi_user_t *u = user_by_name(s->user);
+                if (u != NULL)
+                    limit = u->priv;
+                if (req[6] > limit) {
+                    logmsg("set-priv: '%s' asked for %u, limited to %u",
+                           s->user, req[6], limit);
+                    rsp[6] = 0x81;                  /* requested level not available */
+                    break;
+                }
                 s->priv = req[6];
+            }
             rsp[n++] = 4;
             break;
 
@@ -1590,6 +2730,14 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
                 rsp[6] = CC_INVALID_DATA;
                 break;
             }
+            /* power/reset needs operator (3) or above; a session authenticated
+             * as a lower-privilege account must not be able to cycle the host */
+            if (s != NULL && s->priv < 3) {
+                logmsg("chassis control refused: '%s' has privilege %u",
+                       s->user, s->priv);
+                rsp[6] = 0x80;                      /* insufficient privilege */
+                break;
+            }
             op = req[6];
             switch (op) {
             case 0: run_sys_ctrl("-f"); break;      /* power down */
@@ -1662,6 +2810,94 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
 
     case NETFN_SENSOR:
         switch (cmd) {
+        case 0x10:                              /* Get PEF Capabilities */
+            rsp[n++] = 0x51;   /* PEF version 1.5 ("0x51") */
+            rsp[n++] = 0x11;   /* supports alert + power-down actions */
+            rsp[n++] = 0x00;   /* event filter table entries */
+            rsp[n++] = 0x00;   /* alert policy table entries */
+            rsp[n++] = 0x00;   /* alert strings */
+            break;
+
+        case 0x11:                              /* Arm PEF Postpone Timer */
+            break;                              /* accepted, no timer needed */
+
+        case 0x13: {                            /* Get PEF Config Param */
+            uint8_t sel = (reqlen - 7) > 0 ? req[6] : 0;
+
+            rsp[n++] = 0x11;                    /* parameter revision */
+            switch (sel) {
+            case 1:  rsp[n++] = 0x51; break;                  /* PEF version */
+            case 2:  rsp[n++] = g_pef.global; break;
+            case 3:  rsp[n++] = g_pef.percontrol; break;
+            case 4:  rsp[n++] = g_pef.startup; break;
+            case 5:  rsp[n++] = g_pef.alert_startup; break;
+            case 6:  case 7:  case 8:
+            case 9:  case 10: case 11:
+                rsp[n++] = 0x00;                /* table sizes: none */
+                break;
+            case 12: rsp[n++] = 0x01; break;     /* action support: alert */
+            default:
+                n--;                            /* drop the revision byte */
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            break;
+        }
+
+        case 0x12: {                            /* Set PEF Config Param */
+            uint8_t sel = (reqlen - 7) > 0 ? req[6] : 0;
+            uint8_t val = (reqlen - 7) > 1 ? req[8] : 0;
+
+            switch (sel) {
+            case 1:  break;                     /* version is read-only */
+            case 2:  g_pef.global = val;        break;
+            case 3:  g_pef.percontrol = val;    break;
+            case 4:  g_pef.startup = val;       break;
+            case 5:  g_pef.alert_startup = val; break;
+            default:
+                rsp[6] = CC_INVALID_DATA;       /* table sizes are ours */
+                break;
+            }
+            if (rsp[6] == CC_OK) {
+                pef_save();
+                logmsg("pef: param %u -> 0x%02x", sel, val);
+            }
+            break;
+        }
+
+        case 0x14:                              /* Get Last Processed Event ID */
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00;
+            rsp[n++] = 0x00;
+            break;
+
+        case 0x15:                              /* Set Last Processed Event ID */
+            break;
+
+        case 0x16: {                            /* Alert Immediate */
+            /* send one test PET to the given destination -- this is the
+             * standard "does my trap receiver work" hook */
+            uint8_t dsel = (reqlen - 7) > 0 ? req[6] : 0;
+            uint8_t rec[16];
+
+            if (dsel < 1 || dsel > ALERT_MAX ||
+                !g_alert[dsel - 1].enabled ||
+                g_alert[dsel - 1].ip.s_addr == 0) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            memset(rec, 0, sizeof(rec));
+            rec[0] = 0x00;                     /* record id */
+            rec[10] = 0x37;                    /* sensor type: system firmware */
+            rec[11] = 0x00;                    /* sensor number */
+            rec[12] = 0x6f;                    /* event dir/type */
+            wr_le32(rec + 3, (uint32_t)time(NULL));
+            logmsg("pef: alert immediate to destination %u", dsel);
+            pet_send(rec, 3);                  /* 3 = test */
+            break;
+        }
+
         case 0x2D: {                                /* Get Sensor Reading */
             int i, raw, st = 0;
             long v;
@@ -1765,22 +3001,68 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             break;
         }
 
-        case 0x20:                                  /* Get SDR Repository Info */
+        case 0x20: {                                /* Get SDR Repository Info */
+            int total = sdr_rec_count();
+            int freeb = (SDR_USER_MAX - g_nusdr) * SDR_REC_MAX;
+            if (freeb > 0xffff)
+                freeb = 0xffff;
             rsp[n++] = 0x51;
-            rsp[n++] = (uint8_t)(g_nsensors & 0xff);
-            rsp[n++] = (uint8_t)(g_nsensors >> 8);
-            rsp[n++] = 0xff; rsp[n++] = 0xff;       /* free space: n/a */
-            rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
-            rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0; rsp[n++] = 0;
-            rsp[n++] = 0x02;                        /* reserve supported */
+            rsp[n++] = (uint8_t)(total & 0xff);
+            rsp[n++] = (uint8_t)(total >> 8);
+            rsp[n++] = (uint8_t)(freeb & 0xff);
+            rsp[n++] = (uint8_t)(freeb >> 8);
+            rsp[n++] = (uint8_t)(g_sdr_add_ts & 0xff);      /* last addition */
+            rsp[n++] = (uint8_t)((g_sdr_add_ts >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((g_sdr_add_ts >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((g_sdr_add_ts >> 24) & 0xff);
+            rsp[n++] = (uint8_t)(g_sdr_erase_ts & 0xff);    /* last erase */
+            rsp[n++] = (uint8_t)((g_sdr_erase_ts >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((g_sdr_erase_ts >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((g_sdr_erase_ts >> 24) & 0xff);
+            /* reserve + partial add + alloc info + delete are all implemented */
+            rsp[n++] = 0x0f;
             break;
+        }
+
+        case 0x21: {                                /* Get SDR Repository Allocation Info */
+            int info = ((reqlen - 7) >= 3) ? req[8] : 0;
+            int total = SDR_USER_MAX;
+            int used  = g_nusdr * SDR_REC_MAX;
+
+            if (info == 0) {                        /* allocation units */
+                rsp[n++] = (uint8_t)(total & 0xff);
+                rsp[n++] = (uint8_t)(total >> 8);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX & 0xff);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX >> 8);
+            } else if (info == 1) {                 /* bytes used */
+                rsp[n++] = (uint8_t)(used & 0xff);
+                rsp[n++] = (uint8_t)((used >> 8) & 0xff);
+                rsp[n++] = (uint8_t)((used >> 16) & 0xff);
+                rsp[n++] = (uint8_t)((used >> 24) & 0xff);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX & 0xff);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX >> 8);
+            } else if (info == 2) {                 /* bytes free */
+                int freeb = (SDR_USER_MAX - g_nusdr) * SDR_REC_MAX;
+                rsp[n++] = (uint8_t)(freeb & 0xff);
+                rsp[n++] = (uint8_t)((freeb >> 8) & 0xff);
+                rsp[n++] = (uint8_t)((freeb >> 16) & 0xff);
+                rsp[n++] = (uint8_t)((freeb >> 24) & 0xff);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX & 0xff);
+                rsp[n++] = (uint8_t)(SDR_REC_MAX >> 8);
+            } else {
+                rsp[6] = CC_INVALID_DATA;
+            }
+            break;
+        }
 
         case 0x22:                                  /* Reserve SDR Repository */
             rsp[n++] = 0x00; rsp[n++] = 0x00;
             break;
 
         case 0x23: {                                /* Get SDR */
-            int idx, off, want, avail, chunk;
+            int idx, off, want, avail, chunk, total = sdr_rec_count();
+            const uint8_t *rec;
+            int reclen = 0;
             uint16_t rid, next;
 
             if ((reqlen - 7) < 6) {
@@ -1791,25 +3073,154 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             off  = req[10];
             want = req[11];
             if (rid == 0x0000 || rid == 0xffff)
-                rid = 0x0001;                       /* first record */
-            idx = (int)rid - 1;
-            if (idx < 0 || idx >= g_nsensors || want == 0) {
+                rid = sdr_id_of(0);                 /* first record */
+            idx = sdr_idx_of(rid);
+            if (idx < 0 || want == 0) {
                 rsp[6] = CC_INVALID_DATA;
                 break;
             }
-            avail = g_sdr_len[idx] - off;
+            rec = sdr_rec_of(idx, &reclen);
+            if (rec == NULL) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            avail = reclen - off;
             if (avail <= 0) {
                 rsp[6] = CC_INVALID_DATA;
                 break;
             }
             chunk = want < avail ? want : avail;
-            next  = (uint16_t)((idx + 1 < g_nsensors) ? idx + 2 : 0xffff);
+            next  = (idx + 1 < total) ? sdr_id_of(idx + 1) : 0xffff;
             rsp[n++] = (uint8_t)(next & 0xff);
             rsp[n++] = (uint8_t)(next >> 8);
-            memcpy(rsp + n, g_sdr_blob + g_sdr_off[idx] + off, (size_t)chunk);
+            memcpy(rsp + n, rec + off, (size_t)chunk);
             n += chunk;
             break;
         }
+
+        case 0x24: {                                /* Add SDR */
+            int len = reqlen - 7;                   /* last byte is the checksum */
+            int slot;
+
+            if (len < 5) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (len > SDR_REC_MAX)
+                len = SDR_REC_MAX;
+            slot = sdr_user_add(req + 6, len);
+            if (slot < 0) {
+                rsp[6] = 0x80;                      /* repository full */
+                break;
+            }
+            /* the BMC assigns the record ID, whatever the host put in bytes 0-1 */
+            g_usdr[slot][0] = (uint8_t)((SDR_USER_ID0 + slot) & 0xff);
+            g_usdr[slot][1] = (uint8_t)((SDR_USER_ID0 + slot) >> 8);
+            g_sdr_add_ts = (uint32_t)time(NULL);
+            sdr_user_save();
+            rsp[n++] = g_usdr[slot][0];
+            rsp[n++] = g_usdr[slot][1];
+            break;
+        }
+
+        case 0x25: {                                /* Partial Add SDR */
+            int off, more, len, slot;
+
+            if ((reqlen - 7) < 5) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            off  = req[8];
+            more = req[9];
+            len  = reqlen - 11;                     /* 4 header bytes + checksum */
+            if (more != 0 && off == 0) {            /* first fragment */
+                g_sdr_stage_len = 0;
+                g_sdr_stage_off = 0;
+            }
+            if (off != g_sdr_stage_off) {           /* pieces must be contiguous */
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (g_sdr_stage_len + len > SDR_REC_MAX) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            memcpy(g_sdr_stage + g_sdr_stage_len, req + 10, (size_t)len);
+            g_sdr_stage_len += len;
+            g_sdr_stage_off += len;
+            if (more != 0) {                        /* more to come */
+                rsp[n++] = 0x00; rsp[n++] = 0x00;   /* no record ID yet */
+                break;
+            }
+            slot = sdr_user_add(g_sdr_stage, g_sdr_stage_len);
+            if (slot < 0) {
+                rsp[6] = 0x80;
+                break;
+            }
+            g_usdr[slot][0] = (uint8_t)((SDR_USER_ID0 + slot) & 0xff);
+            g_usdr[slot][1] = (uint8_t)((SDR_USER_ID0 + slot) >> 8);
+            g_sdr_add_ts = (uint32_t)time(NULL);
+            sdr_user_save();
+            rsp[n++] = g_usdr[slot][0];
+            rsp[n++] = g_usdr[slot][1];
+            break;
+        }
+
+        case 0x26: {                                /* Delete SDR */
+            int rid, idx;
+
+            if ((reqlen - 7) < 2) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            rid = req[6] | (req[7] << 8);
+            idx = rid - SDR_USER_ID0;
+            if (idx < 0 || idx >= g_nusdr) {
+                /* the generated sensor records cannot be deleted */
+                rsp[6] = 0xcb;                      /* record not found */
+                break;
+            }
+            memmove(g_usdr[idx], g_usdr[idx + 1],
+                    (size_t)((g_nusdr - idx - 1) * SDR_REC_MAX));
+            memmove(&g_usdr_len[idx], &g_usdr_len[idx + 1],
+                    (size_t)((g_nusdr - idx - 1) * sizeof(g_usdr_len[0])));
+            g_nusdr--;
+            sdr_user_save();
+            break;
+        }
+
+        case 0x27: {                                /* Clear SDR Repository */
+            if ((reqlen - 7) < 5) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            if (!(req[8] == 'C' && req[9] == 'L' && req[10] == 'R' &&
+                  (req[11] & 0x0f) == 0x0a)) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            g_nusdr = 0;
+            g_sdr_erase_ts = (uint32_t)time(NULL);
+            sdr_user_save();
+            break;
+        }
+
+        case 0x28: {                                /* Get SDR Repository Time */
+            uint32_t t = (uint32_t)time(NULL);
+            rsp[n++] = (uint8_t)(t & 0xff);
+            rsp[n++] = (uint8_t)((t >> 8) & 0xff);
+            rsp[n++] = (uint8_t)((t >> 16) & 0xff);
+            rsp[n++] = (uint8_t)((t >> 24) & 0xff);
+            break;
+        }
+
+        case 0x29:                                  /* Set SDR Repository Time */
+        case 0x2a:                                  /* Enter Update Mode */
+        case 0x2b:                                  /* Exit Update Mode */
+        case 0x2c:                                  /* Run Initialization Agent */
+            /* nothing to do: the repository the host writes lives in /config,
+             * so there is no update modal to enter or leave */
+            break;
 
         case 0x40: {                                /* Get SEL Info */
             int cnt = sel_load(g_selwork, SEL_MAX);
@@ -1887,6 +3298,12 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
         }
 
         case 0x47:                                  /* Clear SEL */
+            /* erasing the event log is an operator/admin action */
+            if (s != NULL && s->priv < 3) {
+                logmsg("clear SEL refused: '%s' has privilege %u", s->user, s->priv);
+                rsp[6] = 0x80;                      /* insufficient privilege */
+                break;
+            }
             if ((reqlen - 7) >= 5) {
                 if ((req[8] == 'C') && (req[9] == 'L') && (req[10] == 'R') &&
                     (req[11] & 0x0f) == 0x0a)
@@ -1916,9 +3333,199 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
 
     case NETFN_TRANSPORT:
         switch (cmd) {
+        case 0x01: {                            /* Set LAN Configuration Params */
+            uint8_t ch  = (reqlen - 7) > 0 ? (uint8_t)(req[6] & 0x0f) : 0;
+            uint8_t sel = (reqlen - 7) > 1 ? req[7] : 0;
+            const uint8_t *pd = req + 8;
+            int dlen = reqlen - 9;
+            char ifname[32], key[192], val[64];
+            char ip[32], mask[32];
+            int prefix = 0, i;
+
+            if (ch != 1 && ch != 0x0e && ch != 0x0f) {
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            ifname[0] = '\0';
+            {
+                struct in_addr imask;
+                unsigned char imac[6];
+                imask.s_addr = 0;
+                memset(imac, 0, sizeof(imac));
+                iface_for_addr(g_local_ip, ifname, sizeof(ifname), &imask, imac);
+            }
+            if (ifname[0] == '\0')
+                snprintf(ifname, sizeof(ifname), "eth1");
+
+            switch (sel) {
+            case LANP_SET_IN_PROGRESS:          /* "set in progress" handshake */
+                break;
+
+            case LANP_IP_ADDRESS:
+                if (dlen < 4) { rsp[6] = CC_INVALID_DATA; break; }
+                snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                         pd[0], pd[1], pd[2], pd[3]);
+                snprintf(key, sizeof(key),
+                         "/config/system/mgmt/interface-list/%s/ipv4-address",
+                         ifname);
+                if (conf_set_line(key, ip) != 0) { rsp[6] = CC_INVALID_DATA; break; }
+                conf_rehash();
+                logmsg("lan: %s ipv4-address -> %s (takes effect when is_mgmtd "
+                       "re-applies its configuration)", ifname, ip);
+                break;
+
+            case LANP_SUBNET_MASK:
+                if (dlen < 4) { rsp[6] = CC_INVALID_DATA; break; }
+                snprintf(mask, sizeof(mask), "%u.%u.%u.%u",
+                         pd[0], pd[1], pd[2], pd[3]);
+                for (i = 0; i < 4; i++) {
+                    int b = pd[i];
+                    while (b & 0x80) { prefix++; b = (b << 1) & 0xff; }
+                }
+                snprintf(key, sizeof(key),
+                         "/config/system/mgmt/interface-list/%s/ipv4-prefix",
+                         ifname);
+                snprintf(val, sizeof(val), "%d", prefix);
+                if (conf_set_line(key, val) != 0) { rsp[6] = CC_INVALID_DATA; break; }
+                conf_rehash();
+                logmsg("lan: %s subnet mask %s -> /%d", ifname, mask, prefix);
+                break;
+
+            case LANP_IP_ADDRESS_SOURCE:
+                if (dlen < 1) { rsp[6] = CC_INVALID_DATA; break; }
+                snprintf(key, sizeof(key),
+                         "/config/system/mgmt/interface-list/%s/ipv4-origin",
+                         ifname);
+                snprintf(val, sizeof(val), "%s", pd[0] == 2 ? "dhcp" : "static");
+                if (conf_set_line(key, val) != 0) { rsp[6] = CC_INVALID_DATA; break; }
+                conf_rehash();
+                logmsg("lan: %s ipv4-origin -> %s", ifname, val);
+                break;
+
+            case LANP_DEFAULT_GATEWAY:
+                if (dlen < 4) { rsp[6] = CC_INVALID_DATA; break; }
+                snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                         pd[0], pd[1], pd[2], pd[3]);
+                if (conf_set_line("/config/system/mgmt/default-gateway", ip) != 0) {
+                    rsp[6] = CC_INVALID_DATA;
+                    break;
+                }
+                conf_rehash();
+                logmsg("lan: default-gateway -> %s", ip);
+                break;
+
+            case 18: {                          /* Alert Destination Type */
+                uint8_t dsel = dlen > 0 ? pd[0] : 0;
+                if (dsel < 1 || dsel > ALERT_MAX || dlen < 4) {
+                    rsp[6] = CC_INVALID_DATA;
+                    break;
+                }
+                g_alert[dsel - 1].type        = pd[1];
+                g_alert[dsel - 1].ack_timeout = (uint8_t)(pd[2] & 0x3f);
+                g_alert[dsel - 1].retries     = (uint8_t)((pd[2] >> 6) & 0x03);
+                g_alert[dsel - 1].addr_format = pd[3];
+                g_alert[dsel - 1].enabled     = pd[1] != 0 ? 1 : 0;
+                alert_save();
+                logmsg("lan: alert destination %u type %u enabled %u",
+                       dsel, pd[1], g_alert[dsel - 1].enabled);
+                break;
+            }
+
+            case 19: {                          /* Alert Destination Address */
+                uint8_t dsel = dlen > 0 ? pd[0] : 0;
+                if (dsel < 1 || dsel > ALERT_MAX || dlen < 5) {
+                    rsp[6] = CC_INVALID_DATA;
+                    break;
+                }
+                memcpy(&g_alert[dsel - 1].ip.s_addr, pd + 1, 4);
+                alert_save();
+                logmsg("lan: alert destination %u -> %s", dsel,
+                       inet_ntoa(g_alert[dsel - 1].ip));
+                break;
+            }
+
+            case LANP_NUM_DESTINATIONS:         /* informational, read-only */
+                break;
+
+            case LANP_AUTH_TYPE_ENABLE: {
+                /* 5 bytes: per privilege level */
+                int k;
+                if (dlen < 5) { rsp[6] = CC_INVALID_DATA; break; }
+                for (k = 0; k < 5; k++)
+                    g_lan.auth_enables[k] = pd[k];
+                lanparams_save();
+                logmsg("lan: auth enables %02x %02x %02x %02x %02x",
+                       pd[0], pd[1], pd[2], pd[3], pd[4]);
+                break;
+            }
+
+            case LANP_AUTH_TYPE_SUPPORT:
+                if (dlen < 1) { rsp[6] = CC_INVALID_DATA; break; }
+                g_lan.auth_types = pd[0];
+                lanparams_save();
+                logmsg("lan: auth types -> 0x%02x", pd[0]);
+                break;
+
+            case LANP_COMMUNITY_STRING: {
+                int n = dlen > 17 ? 17 : dlen;
+                if (n < 1) { rsp[6] = CC_INVALID_DATA; break; }
+                memset(g_lan.community, 0, sizeof(g_lan.community));
+                memcpy(g_lan.community, pd, (size_t)n);
+                lanparams_save();
+                logmsg("lan: SNMP community -> '%s' (used by PET)", g_lan.community);
+                break;
+            }
+
+            case LANP_BMC_ARP_CONTROL:
+                if (dlen < 1) { rsp[6] = CC_INVALID_DATA; break; }
+                g_lan.arp_control = pd[0];
+                lanparams_save();
+                break;
+
+            case LANP_GRATUITOUS_ARP:
+                if (dlen < 1) { rsp[6] = CC_INVALID_DATA; break; }
+                g_lan.garp_interval = pd[0];
+                lanparams_save();
+                break;
+
+            case LANP_8021Q_VLAN_ID: {
+                /* this really does reconfigure the interface: mgmtd turns
+                 * eth1 into a VLAN sub-interface on its next start, so a wrong
+                 * value means losing the BMC until you reach the console */
+                unsigned vlan;
+                if (dlen < 2) { rsp[6] = CC_INVALID_DATA; break; }
+                vlan = (unsigned)(pd[0] | (pd[1] << 8));
+                if (vlan > 4094) { rsp[6] = CC_INVALID_DATA; break; }
+                snprintf(key, sizeof(key),
+                         "/config/system/mgmt/interface-list/%s/vlan", ifname);
+                snprintf(val, sizeof(val), "%u", vlan);
+                if (conf_set_line(key, val) != 0) {
+                    rsp[6] = CC_INVALID_DATA;
+                    break;
+                }
+                conf_rehash();
+                logmsg("lan: %s vlan -> %u (takes effect when is_mgmtd applies "
+                       "its configuration -- the switch port must be tagged the "
+                       "same way)", ifname, vlan);
+                break;
+            }
+
+            case LANP_8021Q_VLAN_PRIORITY:
+                /* priority comes from the socket, nothing to store */
+                break;
+
+            default:
+                /* unknown parameter: say so instead of pretending */
+                rsp[6] = CC_INVALID_DATA;
+                break;
+            }
+            break;
+        }
+
         case 0x02: {                            /* Get LAN Configuration Params */
             uint8_t ch       = (reqlen - 7) > 0 ? (uint8_t)(req[6] & 0x0f) : 0;
             uint8_t sel      = (reqlen - 7) > 1 ? req[7] : 0;
+            uint8_t dsel     = (reqlen - 7) > 2 ? req[8] : 0;
             int     rev_only = (reqlen - 7) > 0 && (req[6] & 0x80);
             uint8_t pd[64];
             int     plen2, start = n;
@@ -1930,7 +3537,7 @@ static int dispatch_ipmi(const uint8_t *req, int reqlen,
             rsp[n++] = 0x11;                /* parameter revision 1 */
             if (rev_only)
                 break;
-            plen2 = lan_param(pd, (int)sizeof(pd), sel);
+            plen2 = lan_param(pd, (int)sizeof(pd), sel, dsel);
             if (plen2 < 0) {
                 n = start;                  /* drop the revision byte again */
                 rsp[6] = CC_INVALID_DATA;
@@ -2040,16 +3647,53 @@ static session_t *by_rc_id(uint32_t id)
 
 static void drop_session(session_t *s);
 
+/* IPMI lets the BMC close an idle session; without this, eight abandoned
+ * sessions (a polling tool that dies, a client that never sends Close Session)
+ * fill the table and the next open-session has to evict a live one. */
+#define SESSION_IDLE_TIMEOUT 60
+
+static void sessions_expire(void)
+{
+    time_t now = time(NULL);
+    int i;
+
+    for (i = 0; i < MAX_SESSIONS; i++) {
+        if (!g_sessions[i].in_use)
+            continue;
+        /* last == 0 means "allocated but nothing received yet" -- that is a
+         * session in the middle of its handshake, not an idle one */
+        if (g_sessions[i].last == 0 ||
+            now - g_sessions[i].last < SESSION_IDLE_TIMEOUT)
+            continue;
+        if (g_sessions[i].sol_cfd >= 0)      /* console traffic keeps it alive */
+            continue;
+        logmsg("expiring idle session rm=0x%08x user=%s",
+               g_sessions[i].rm_id, g_sessions[i].user);
+        drop_session(&g_sessions[i]);
+    }
+}
+
 static session_t *alloc_session(void)
 {
     int i, oldest = 0;
+
+    sessions_expire();
     for (i = 0; i < MAX_SESSIONS; i++) {
-        if (!g_sessions[i].in_use)
+        if (!g_sessions[i].in_use) {
+            /* stamp it now: an un-stamped slot looks like the oldest one and
+             * the next open-session would recycle it right out from under the
+             * client that just opened it */
+            g_sessions[i].last = time(NULL);
             return &g_sessions[i];
+        }
         if (g_sessions[i].last < g_sessions[oldest].last)
             oldest = i;
     }
+    /* every slot is genuinely in use: recycle the least recently used one */
+    logmsg("all %d sessions busy, recycling the oldest (rm=0x%08x)",
+           MAX_SESSIONS, g_sessions[oldest].rm_id);
     drop_session(&g_sessions[oldest]);
+    g_sessions[oldest].last = time(NULL);
     return &g_sessions[oldest];
 }
 
@@ -2197,6 +3841,16 @@ static void handle_rakp1(int fd, const struct sockaddr_in *to,
     }
 
     snprintf(s->user, sizeof(s->user), "%s", user);
+    /* the account's maximum privilege caps whatever the client asked for.
+     * Only s->priv is clamped -- the role byte feeds the RAKP MACs. */
+    {
+        ipmi_user_t *uu = user_by_name(user);
+        if (uu && role > uu->priv) {
+            logmsg("rakp1: '%s' asked for privilege %u, capped to %u",
+                   user, role, uu->priv);
+            role = uu->priv;
+        }
+    }
     s->priv = role;
     rand_bytes(s->rm_rand, 16);
     derive_keys(s, pass, s->role_byte);
@@ -2296,8 +3950,10 @@ static void session_keys(const session_t *s, const uint8_t **k1,
 {
     int alt = s->key_variant > 0;
 
-    *k1 = alt ? s->k1_alt : s->k1;
-    *k2 = alt ? s->k2_alt : s->k2;
+    if (k1 != NULL)
+        *k1 = alt ? s->k1_alt : s->k1;
+    if (k2 != NULL)
+        *k2 = alt ? s->k2_alt : s->k2;
 }
 
 /* wrap a payload into an encrypted, integrity protected RMCP+ packet */
@@ -2622,11 +4278,10 @@ static void handle_encapsulated(int fd, const struct sockaddr_in *to,
 
     /* confidentiality: 16-byte IV then AES-CBC-128 */
     {
-        const uint8_t *k1, *k2;
+        const uint8_t *k2;
         int clen;
 
-        session_keys(s, &k1, &k2);
-        (void)k1;
+        session_keys(s, NULL, &k2);
         memcpy(iv, pkt + 16, 16);
         clen = plen - 16;
         if (clen <= 0 || clen > (int)sizeof(plain) || (clen % 16) != 0)
@@ -2837,9 +4492,16 @@ int main(int argc, char **argv)
     load_users();
     if (g_nusers == 0)
         logmsg("warning: no users loaded, every login will fail");
+    pef_load();
+    alert_load();
+    lanparams_load();
+    /* LOG_USER, not LOG_DAEMON: rsyslog on this box drops daemon.* while
+     * user.* lands in /var/log/messages, which is where an operator looks */
+    openlog("ubmc-ipmi", LOG_PID, LOG_USER);
 
     sensors_scan();
     sdr_build();
+    sdr_user_load();
     fru_build();
     boot_flags_load();
     for (i = 0; i < MAX_SESSIONS; i++)
@@ -2866,6 +4528,8 @@ int main(int argc, char **argv)
             fds[nfds++] = fd;
             if (fd > maxfd)
                 maxfd = fd;
+            if (nfds == 1)
+                snprintf(g_bind_dev, sizeof(g_bind_dev), "%s", p);
             logmsg("listening on udp/%d dev=%s", IPMI_PORT, *p ? p : "any");
         }
         p = comma ? comma + 1 : NULL;
@@ -2897,7 +4561,10 @@ int main(int argc, char **argv)
         r = select(maxfd2 + 1, &rfds, NULL, NULL, &tv);
         if (r < 0)
             continue;
-
+        if (r == 0) {
+            sessions_expire();              /* idle tick: reap dead sessions */
+            pef_poll();                     /* and look for new SEL events */
+        }
         if (g_sol_owner != NULL && g_sol_owner->sol_cfd >= 0 &&
             FD_ISSET(g_sol_owner->sol_cfd, &rfds)) {
             sol_pump();
