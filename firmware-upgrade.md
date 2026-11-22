@@ -79,6 +79,33 @@ if (flags[UPGRADE] == '2') {          /* 上次升级没确认 → 回滚 */
 }
 ```
 
+### 常见误解：普通重启 / 按 reset **不会**回到原厂
+
+只要 `upgrade flag = 0`，`boot flag` 指向哪就永远起哪一版，
+`reboot`、断电重上电、面板 reset、看门狗复位**全都一样** ——
+它们都不碰 `0x10000` / `0x11000` 这两个字节，也不碰 p2/p3 的分区内容。
+
+**唯一会自己回滚的条件**是启动时读到 `upgrade flag = 2`。什么时候会变成 2：
+
+| 动作 | 结果 |
+|---|---|
+| `is_upgrade.sh -w`（切换软件） | 把 `boot flag` 翻到**另一边**，并**同时把 `upgrade flag` 设成 1** |
+| 之后第一次启动 | U-Boot 把 `upgrade flag` 改成 **2**，从新 bank 启动 |
+| 若没人确认（`is_upgrade.sh -C`，Web 升级页会触发） | **下一次重启** → U-Boot 翻回原 bank 并清零 ← 表现为"重启就回去了" |
+
+所以"按一下 reset 就回原厂"的观感，几乎都是**之前跑过 `-w` / 升级流程却没确认**，
+`upgrade flag` 停在 2 造成的；不是 reset 键特殊。
+
+自查与手动切换（都在 BMC 上）：
+
+```sh
+is_upgrade.sh -s                                   # boot:1 upgrade:0  → 下次还是 bank 1
+is_upgrade.sh -t fw-boot -v 0; is_upgrade.sh -t fw-upgrade -v 0   # 下次起 bank 0（出厂）
+is_upgrade.sh -t fw-boot -v 1; is_upgrade.sh -t fw-upgrade -v 0   # 下次起 bank 1（自编译）
+```
+
+> ⚠️ **`upgrade flag` 必须是 0**。停在 `1` 或 `2` 就等着被回滚。
+
 ## ★ 第 ④ 步「谁确认」——一个容易踩的坑
 
 `is_upgrade.sh -C`（`confirm_software_upgrade()`）把 `upgrade flag` 从 `2` 改成 `0`。
