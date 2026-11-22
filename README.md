@@ -11,6 +11,13 @@
 
 > **只想要一份能跑的固件？** 直接跳到 [第 0 步](#第-0-步准备一台构建机)，
 > 三步走完就有镜像。后面的参考不用读。
+>
+> **只想要 IPMI over LAN / SOL / 告警？** 不用重编整个固件，直接看
+> [ipmi-lan.md](ipmi-lan.md)：里面的守护进程是静态链接的，丢到 `/config` 里就能升级。
+
+**这个仓库里还有什么**（都在这份 README 的「详细文档」里有索引）：
+自建的 **IPMI 2.0 over LAN 服务端**（[ipmi-lan.md](ipmi-lan.md)、[sol-design.md](sol-design.md)）、
+REST/Redfish 移植、防火墙上游化、eMMC/出厂镜像差异分析、A/B 升级与救砖。
 
 | 项 | 值 |
 |---|---|
@@ -321,10 +328,13 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 | 分区 | 挂载点 | 内容 |
 |---|---|---|
 | `mmcblk0p1` | — | FAT 启动分区（`MLO` / `u-boot.img` / `boot0.scr` / `zImage` …） |
-| `mmcblk0p5` | `/config` | **mgmtd 配置库**（`is_mgmtd.conf` 等），口令/网络都在这里 |
-| `mmcblk0p8` | `/var/images` | 4.5 G 可用，**放工具和测试 rootfs 的地方** |
+| `mmcblk0p2` | — | **bank 0** 的 rootfs（安全网，刷坏了 U-Boot 会自动回滚到它） |
+| `mmcblk0p3` | — | **bank 1** 的 rootfs（我们刷的那份）+ `software_version.txt` |
+| `mmcblk0p5` | `/config` | **mgmtd 配置库**（`is_mgmtd.conf` 等）：口令、网络、IPMI 用户与 PEF 都在这里 |
+| `mmcblk0p7` | `/var/log` | 日志（含厂商 SEL 文件 `/var/log/sel`） |
+| `mmcblk0p8` | `/var/images` | 4.9 G，**放工具、测试 rootfs、待刷镜像的地方** |
 
-`/etc`、`/tmp` 都在 initramfs/tmpfs 里，重启即丢。
-
----
----
+`/`（含 `/usr`、`/etc`）是 **ramdisk**（`root=/dev/ram0`），每次开机从 p2/p3 的镜像
+重建 —— 所以直接往 `/usr/sbin` 里丢东西重启就没了，要持久就得写进 `/config`
+或重打镜像（[ipmi-lan.md](ipmi-lan.md) 里的 `S47is_ipmi_lan` + `repack-bank.sh` 就是这么做的）。
+`/tmp`、`/run` 是 tmpfs，重启即丢。
