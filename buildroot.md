@@ -207,7 +207,7 @@ console=ttyS0,115200n8 root=/dev/ram0 rw quiet loglevel=2
 
 ## 第二十五轮起的实际做法：静态交叉编译
 
-日常改的其实只是 **`ipmi-lan/ubmc_ipmi_lan.c`** 这一个守护进程（约 4,660 行）。
+日常改的其实只是 **`ipmi-lan/ubmc_ipmi_lan.c`** 这一个守护进程（4,711 行）。
 为它每次跑 20~40 分钟的 Buildroot 全量构建不现实，而且有两个硬约束：
 
 1. **BMC 上没有 buildroot 工具链，也没法常驻**。
