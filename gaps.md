@@ -107,13 +107,25 @@ bmc-fan.lua + thermal_profile/fullspeed.conf  2 项
 - `fullspeed.conf` 同理
 - phonehome/S99seth 是 Keysight 的回报模块
 
-### ⚪ C. 死文件与冗余路径（12 个文件）
+### ⚪ C. 死文件与冗余路径（12 个文件）—— **我们的镜像里本来就没有**
 
 ```
 usr/lib/libnetsnmp*.so.35(.0.0)      10 项   只被彼此引用的孤儿
 usr/lib/tmpfiles.d/sudo.conf          1 项   systemd 专用，我们是 busybox init
 usr/lib64/sa/sa{1,2}, sadc            3 项   与 usr/lib/sa/ 重复（我们已有）
 ```
+
+这 12 项只存在于**出厂** 1.2.0.8 镜像里；我们的基线是公开源码 bd9de8c 自己
+buildroot 出来的，实测（v20 镜像 + 真机）都不存在：
+
+```
+/usr/lib/libnetsnmp*.so.35*  -> 0 个
+/usr/lib64/sa                -> 不存在
+/usr/lib/tmpfiles.d          -> 不存在
+/usr/lib/sa/{sa1,sa2,sadc}   -> 存在（唯一一份，68 KB 的 sadc）
+```
+
+所以「清死文件」这条**无需动作**，收益（~6 MB）在重建时已经自然拿到。
 
 `.35` 系列已在 [dead-libs-audit.md](./dead-libs-audit.md) 逐条核查过：
 出厂镜像里就是孤儿，没有任何 ELF 引用它们。
@@ -168,13 +180,29 @@ ss -uln   -> 只有 0.0.0.0:68（DHCP client），没有 623/udp
 
 细节与踩坑见 [ipmi-lan.md](./ipmi-lan.md) 和 [sol-design.md](./sol-design.md)。
 
-仍缺（都不影响日常运维）：
+仍缺（只有一项，而且是不该做的）：
 
-- **Set LAN Configuration Parameters**（Transport 0x0C 0x01）—— 读全部实现了
-  （`ipmitool lan print` 出真实 IP/掩码/MAC/网关），写没做，`lan set` 返回 `0xC1`。
-- Set LAN Config / Get-Set User Access / IPMB 桥接 / PEF / SDR 写入。
+- **IPMB 桥接** —— 未实现，也**没有可桥对象**：板上 i2c 没有 0x20 类从机地址，
+  NetFn `0x2C` 直接回 `0xC1`（Invalid Command）—— 这正是「没有桥的 BMC」的
+  标准应答，不是缺陷。
 
-第九轮已经把 SHA-256 cipher suite（17/18/19）、主机→客户端 BREAK 通知补齐了。
+> 第二十五轮补齐了原来列的另外两项：
+> **Set LAN Config 的次要参数**（VLAN / community / auth enable / ARP 控制，
+> 全部可读写并持久化）和 **SDR 设备端写入**（Add / Partial Add / Delete /
+> Clear SDR，落在 `/config/ipmi-sdr-user.conf` 这个真正的用户仓库里，
+> `ipmitool sdr info` 的四项 SDR 能力现在全部是 `yes`）。
+
+第十九轮解决了「开机后 IPMI 不通」，第二十轮补齐用户管理，第二十一轮补齐
+Set LAN 写的常用参数与 PEF 配置面，第二十二轮做了一次代码审视（权限提升、
+会话回收等 6 处），**第二十四轮补齐 PEF 发送器**：告警目的地表（LAN 参数
+17/18/19）、Alert Immediate、SEL 新事件 → syslog + PET（SNMPv1 trap）。
+即「无人值守」这条链路已经通了。**第二十五轮**收尾了 LAN 次要参数和 SDR 仓库，
+并把守护进程改成静态链接、可从 `/config/firmware/` 原地升级（因为 `/` 是
+ramdisk，buildroot 工具链重启就没了）。细节见 [ipmi-lan.md](./ipmi-lan.md)。
+
+> 环境提示：这台机器是 Wi-Fi 接到 BMC 的，短时间连开大量会话时客户端
+> 偶尔会因 UDP 丢包重传（现象是 `Session no longer connected`）。
+> 设备侧日志显示会话都正常建立，属链路问题，不是守护进程缺陷。
 
 ## 五、组件版本陈旧（不是缺，但要知道）
 
@@ -204,15 +232,56 @@ ABI 限制了上限：内核 4.14.54、glibc 2.27、Buildroot 2018.02（2019 EOL
 | 接口（mgmtd 本体） | 3 | ⚪ 无人调用，无影响 |
 | REST API / Redfish | 0 | ✅ **第四轮补齐并实测** |
 | IPMI over LAN | 0 | ✅ **第五~七轮补齐并实测**（含 SEL/SDR/FRU/SOL/BREAK/流控）|
+| IPMI 用户管理 | 0 | ✅ **第二十轮补齐并实测**（user list/set name/password/priv/enable）|
 | 厂商专用（CREANORD/phonehome/bmc-fan） | 22 文件 | ⚪ 本机用不到 |
-| 死文件 / 冗余 | 12 文件 | ⚪ 无引用 |
+| 死文件 / 冗余 | 0 | ⚪ 我们的镜像里本来不存在（见 二.C） |
 
 ## 七、还不算「缺」但可以做的优化
 
 1. ~~**REST/Redfish 移植**~~ —— 已完成。
 2. ~~**IPMI over LAN**~~ —— 已完成（`ubmc_ipmi_lan` + `S47is_ipmi_lan`）。
    继续往深做的话，下一个是 SEL / SDR 传感器桥接。
-3. **`S46is_web_fw` 上游化** —— 如果能改 mgmtd 源码，把 7681/80 的防火墙
-   例外和 restapi/redfish 路由都交给它自己的模板生成，init 脚本就可以去掉。
-4. **杀掉冗余** —— 出厂遗留的 .35 库和 `usr/lib64/sa` 可以清掉，
-   省 ~6 MB，但收益不大。
+3. ~~**`S46is_web_fw` 上游化**~~ —— **防火墙部分已完成，路由部分做不到**。
+   防火墙例外已经全部上游化：新增 `S44is_fw_conf`（排在 `S45is_mgmtd` 之前）把
+   `pub-console`（7681）/`pub-http`（80）/`pub-ipmi`（623）三条规则写进
+   `/config/is_mgmtd.conf`，由 mgmtd 自己下发；实测重启后它们落在 INPUT 链
+   **中间段**（`58080, 80, 7681, 623, 443, 22, icmp, state, DROP`），不再被
+   mgmtd 后下发的 `-i vrf-pub -j DROP` 埋掉。
+   剩下两项**做不到**，已确认原因：
+
+   - **nginx 的 `/restapi` `/redfish` 路由**：`/etc/nginx/nginx.conf` 头部写明由
+     `is_mgmtd_start_nginx` 生成，模板**编在 `is_mgmtd` 二进制里**；`strings` 只有
+     `proxy_pass http://%s:%d;` 和 `.../ws;` 两条，配置树里没有任何可注入 location
+     的键，生成的文件里也**没有 `include conf.d`**（只有 `include mime.types;`），
+     连"放一个片段进去"的路都没有 → 只能由 `S46is_web_fw` 在生成后补。
+     顺带确认 **uhttpd 是用命令行启动的**（`-p 0.0.0.0:58080 -h /opt/silc-web/host/www`，
+     没有 `/etc/config/uhttpd`），所以也没法从 uhttpd 侧加 `/restapi` 前缀。
+   - **7681 的 hairpin DROP**：这条规则用的是 `-m mac ! --mac-source <vrf-pub MAC>`，
+     而 vrf 设备的 MAC 每次开机由内核随机生成（实测 4 次启动 4 个不同值），
+     必须运行时读。注意 **mgmtd 自己对 58080 也是这么干的**（同形状的 MAC 规则，
+     硬编码在二进制里），所以它没法替我们表达"本机来源"。
+     `-m addrtype --src-type LOCAL` 是理论替代，但该内核**没有** addrtype 模块
+     （`No chain/target/match by that name`），`-m rpfilter` 同样不可用。
+4. ~~**杀掉冗余**~~ —— 出厂遗留的 `.35` 库、`usr/lib64/sa`、`tmpfiles.d`
+   在我们的镜像里**本来就不存在**（我们的基线是公开源码自己 buildroot 的产物），
+   无需动作，详见「二.C」。
+5. **Get/Set User Access** —— **已完成**（第二十轮）。`ipmitool user list /
+   set name / set password / priv / enable / disable / test` 全部实测通过，
+   账号权限上限会夹住 RAKP 申请的权限，禁用后登录被拒。
+   凭据文件升级为 `id:name:password:max-privilege:enabled`，旧的两字段格式兼容。
+6. ~~**PEF + LAN alert destination**~~ —— **已完成**（第二十一 + 第二十四轮）。
+   0x10/0x11/0x12/0x13/0x14/0x15 实现了配置面，参数 2~5 持久化到
+   `/config/ipmi-pef.conf`；LAN 参数 17/18/19 是告警目的地表
+   （`/config/ipmi-lan-alert.conf`）；`0x16 Alert Immediate` 发测试 trap；
+   SEL 出现新记录（按**时间戳**判断，因为 SEL 是预分配、整表都标 type=0x02）
+   时同时推 **syslog**（`LOG_USER`，rsyslog 只保留 `user.*`）和 **PET**
+   （SNMPv1 trap，UDP 162，community 取 LAN 参数 16）。
+7. ~~**Set LAN Configuration Parameters 的写**~~ —— **已完成全部参数**
+   （第二十一 + 第二十五轮）。IP / 掩码 / IP 源 / 默认网关写到
+   `/config/is_mgmtd.conf` 并重算 `sha1sum`；auth type、community、ARP 控制、
+   gratuitous ARP 间隔写到 `/config/ipmi-lan-params.conf`；VLAN 写
+   `interface-list/<if>/vlan`（会真的改管理连通性，日志里有提示）；告警目的地
+   写 `/config/ipmi-lan-alert.conf`。由 mgmtd 在下次启动时应用（它才是网络的
+   所有者，直接 `ip addr` 会和它打架）。
+8. ~~**SDR 设备端写入**~~ —— **已完成**（第二十五轮）。见
+   [ipmi-lan.md](./ipmi-lan.md)「用户 SDR 仓库」一节。

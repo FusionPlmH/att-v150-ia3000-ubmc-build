@@ -80,9 +80,263 @@ bit5-0 = 长度（≤63）
 
 ## 尚未实现
 
-- **Set LAN Configuration Parameters**（0x0C 0x01）—— 只实现了读，`ipmitool lan set` 会返回
-  `0xC1`。写会牵动 mgmtd 的网络配置，风险大，暂时只读。
-- **SDR 设备端写入 / PEF / IPMB 桥接 / Get-Set User Access** —— 未实现。
+- **IPMB 桥接** —— 未实现，而且**不该实现**：板上 i2c 没有 `0x20` 类从机地址，
+  没有可桥对象；NetFn `0x2C` 直接返回 `0xC1`（Invalid Command），这正是
+  「没有桥的 BMC」的标准应答，ipmitool 等工具不会因此报错。
+
+> 用户管理、Set LAN 写的**全部**参数、PEF 配置面、PET/syslog 发送器、
+> **SDR 仓库写入** 都已实现，见下面各节。
+
+### Set LAN Configuration Parameters 的写（第二十一 / 二十五轮）
+
+两类落点：**会动网络的**交给 mgmtd 的配置树（它才是网络的所有者，直接
+`ip addr` 会和它打架），**纯配置的**进我们自己的小文件。
+
+| 选择子 | 参数 | 落到哪里 |
+|---|---|---|
+| 0 | Set in Progress | 接受并忽略（客户端会先置 1 再置 0）|
+| 1 | Auth Type Support | `/config/ipmi-lan-params.conf` |
+| 2 | Auth Type Enable（5 字节）| 同上 |
+| 3 | IP Address | `interface-list/<if>/ipv4-address` |
+| 4 | IP Address Source | `interface-list/<if>/ipv4-origin`（1→static，2→dhcp）|
+| 6 | Subnet Mask | 换算成前缀写 `interface-list/<if>/ipv4-prefix` |
+| 10 | BMC ARP Control | `/config/ipmi-lan-params.conf`（默认 `0x02`：应答 ARP）|
+| 11 | Gratuitous ARP Interval | 同上（500 ms 为单位，仅存储）|
+| 12 | Default Gateway | `system/mgmt/default-gateway` |
+| 16 | SNMP Community String | `/config/ipmi-lan-params.conf`，**PET 用它当 community** |
+| 17 | Number of Destinations | 只读（按已配的目的地算）|
+| 18/19 | Alert Destination 类型/地址 | `/config/ipmi-lan-alert.conf` |
+| 20 | 802.1q VLAN ID | `interface-list/<if>/vlan`（0=不打标）|
+| 21 | 802.1q VLAN Priority | 接受并忽略（优先级由 socket 决定）|
+
+两个关键点：
+
+- 接口名来自 `IP_PKTINFO` 的**目的地址**（`iface_for_addr()`），所以从哪个口
+  写进来就改哪个口的配置。
+- 写完必须**重算 `/config/is_mgmtd.conf.sha1sum`**（`conf_rehash()` 调
+  `sha1sum`）。mgmtd 启动时 `sha1sum -c` 不过就会删掉 conf 并回滚 `.backup`。
+
+VLAN 这一项是唯一**会真的改变管理连通性**的写：mgmtd 下一次启动会把 eth1
+变成带 tag 的子接口，交换机端口没配成同样的 tag 就联系不上 BMC 了（只能上
+console）。代码里照实写入，日志会留下提示。
+
+### 用户 SDR 仓库（第二十五轮）
+
+传感器记录是每次启动扫 `/dev/i2c-*` + sysfs 现生成的，**没有可写回的地方**，
+所以 `Add SDR` 不能写进"传感器表"。做的是标准做法：一个**独立的用户仓库**。
+
+| 命令 | 行为 |
+|---|---|
+| `0x20` Get SDR Repository Info | 记录数 = 生成的 + 用户的；空闲字节数真实；最后添加/擦除时间戳 |
+| `0x21` Get SDR Repository Allocation Info | info 0/1/2（单元数 / 已用字节 / 空闲字节）|
+| `0x22` Reserve | 回 0 |
+| `0x23` Get SDR | 先遍历生成的记录（ID 1..N），再遍历用户记录（ID `0x0100` 起）|
+| `0x24` Add SDR | 存入用户仓库，**记录 ID 由 BMC 分配**（覆盖请求里的字节）|
+| `0x25` Partial Add SDR | 按 `offset`/`in progress` 拼装，最后一片落盘 |
+| `0x26` Delete SDR | 只删得掉用户记录；删生成的记录回 `0xCB` |
+| `0x27` Clear SDR Repository | 清空用户仓库（`CLR` + `0xAA` 校验）|
+| `0x28`/`0x29` | 仓库时间读 / 写（写=接受并忽略）|
+| `0x2A`/`0x2B`/`0x2C` | 更新模式进/出、Run Init Agent：空操作（用户仓库在 `/config`，没有"模态"）|
+
+持久化在 `/config/ipmi-sdr-user.conf`（一行一条 hex 记录，第一行是时间戳），
+原子写。上限 32 条 × 255 字节。
+
+Operation Support 字节回 `0x0f`（Reserve / Partial Add / Alloc Info / Delete 全支持），
+`ipmitool sdr info` 的四行会全部显示 `yes`。之前回的 `0x02` 声称支持
+Partial Add 却根本没实现命令，属于谎报。
+
+### 静态链接 + 从 `/config` 更新（第二十五轮）
+
+根文件系统是 **ramdisk**（`root=/dev/ram0`，`/proc/mounts` 里 `/` 是 `rootfs`），
+`/usr` 每次开机重建 —— 所以 buildroot 工具链一旦重启就没了，而镜像自带的
+glibc 是 **2.21**，任何现代交叉编译器默认要 2.34+。
+
+于是：
+
+- 在 WSL 里用 `arm-linux-gnueabihf-gcc` + `libssl-dev:armhf` 的 `libcrypto.a`
+  **静态链接**（`scripts/ipmi-lan/build-cross.sh`），产物 2.4 MB（gzip 后 1.5 MB），
+  不依赖镜像里任何 `.so` 版本。
+- `S47is_ipmi_lan` 优先跑 `/config/firmware/ubmc_ipmi_lan`，没有才用
+  `/usr/sbin/ubmc_ipmi_lan`。`/config` 是真实 ext4 分区，**跨重启保留**，
+  所以换版本只要：
+
+```sh
+curl -o /tmp/u.gz http://<dev-host>:8011/ubmc_ipmi_lan.gz
+gunzip -c /tmp/u.gz > /tmp/u.new && chmod 755 /tmp/u.new
+cp /tmp/u.new /config/firmware/ubmc_ipmi_lan.new     # 运行中不能直接覆盖
+mv -f /config/firmware/ubmc_ipmi_lan.new /config/firmware/ubmc_ipmi_lan
+/etc/init.d/S47is_ipmi_lan restart
+```
+
+- `rebuild-image.sh` 也改成优先用 `prebuilt/ubmc_ipmi_lan`，没有才回退到
+  buildroot 交叉编译器 —— 这样即使工具链没了也还能出镜像。
+
+### GRATUITOUS ARP / ARP 控制的语义
+
+参数 10 是**位域**（bit1 = 应答 ARP，bit0 = 发 Gratuitous ARP），参数 11 是
+**间隔**（500 ms 为单位），不是一个布尔量 —— 早先按布尔处理，`ipmitool lan print`
+会显示成 `0.0 seconds` 的"间隔"。现在默认 `0x02`（应答 ARP：内核本来就在做），
+Gratuitous ARP 只存储、不主动发（没有实现）。
+
+### 第二个 VRF 坑：PET 的发送 socket 也要绑（第二十五轮收尾）
+
+IPMI 的监听 socket 绑到 `vrf-pub` 之后，`pet_send()` 里那个**新开的** socket
+仍然是默认表的 —— main 表里连 `192.168.31.0/24` 都没有，于是：
+
+```
+ipmi-lan: pet: send to 192.168.31.52 failed: Network is unreachable
+```
+
+`Alert Immediate` 照样回 `0x00`，日志里也只是一行，客户端看不出来。
+修法：把监听时用的设备名存进 `g_bind_dev`，`pet_send()` 拿到 socket 后
+`SO_BINDTODEVICE` 到同一个设备。syslog 那一半不受影响（不涉及路由）。
+
+> 这个坑只有在**重启后**复测才暴露出来 —— 之前手工 restart 守护进程时
+> 是好的。所以「刷完机再验一遍」不是形式主义。
+
+### 没有 mkimage 时怎么出镜像
+
+根 fs 是 ramdisk 且 `/root` 也在里面，所以 buildroot 工具链重启即消失，
+`rebuild-image.sh` 的 `mkimage` 和原始 `rootfs.cpio.uboot` 一起没了。
+第二十五轮的收尾是在**已安装的镜像上打补丁**：
+
+```sh
+# 在真机上（cpio/gzip/install 都是 busybox）
+sh repack-bank.sh /var/images/r25          # 解包 -> 换文件 -> 重打 -> 校验
+#   他做的检查：目标文件在镜像里存在、没有 IS_* 污染、cpio 清单逐条一致、
+#   新镜像的 header crc / data crc 自校验通过
+# 然后自行 mount /dev/mmcblk0p3、写 rootfs.cpio.uboot、置 is_upgrade 标志
+```
+
+`uimage-wrap.py` 复刻了 mkimage 的 64 字节头（`-T ramdisk -C none -a
+0x88080000`），支持 `info / verify / wrap`。**先 `verify` 现有镜像**能证明
+CRC 算法与 U-Boot 一致（实测 `VERIFY OK`），再 wrap 新镜像才不会做出砖。
+
+保真性对照：把原镜像解开**不改任何文件**再按同样参数重打，得到 54,349,008 B
+（原 54,351,610 B，差 2.6 KB，全部来自 gzip 块/inode 顺序），说明解包/重打
+是无损的。
+
+生效时机：写入的是**持久配置**，由 mgmtd 在下一次启动时应用到网卡 ——
+因为 mgmtd 才是网络的所有者，直接 `ip addr` 改会和它打架。daemon 日志会打印
+`lan: eth1 ipv4-address -> x.x.x.x (takes effect when is_mgmtd re-applies ...)`。
+
+### PEF 配置面（第二十一轮）
+
+| 命令 | 说明 |
+|---|---|
+| 0x10 Get PEF Capabilities | 返回 `51 11 00 00 00`（PEF 1.5，支持 alert/power-down，无过滤器/策略表）|
+| 0x11 Arm PEF Postpone Timer | 接受 |
+| 0x13 Get PEF Config Param | 1=版本(0x51)、2=动作全局控制、3=动作逐项控制、4=启动延时、5=告警启动延时、6~11=表大小(0)、12=动作支持 |
+| 0x12 Set PEF Config Param | 2~5 可写，持久化到 `/config/ipmi-pef.conf` |
+| 0x14 / 0x15 | Last Processed Event ID 读/写 |
+| **0x16 Alert Immediate** | 往指定目的地发一条**测试 PET**（`petEventType=3`），用来验证 trap 接收端 |
+
+### PEF 发送器 + 告警目的地（第二十三轮）
+
+**告警目的地表**（LAN 参数 17/18/19）已可读写，存在 `/config/ipmi-lan-alert.conf`：
+
+```
+# dest:enabled:type:ack_timeout:retries:addr_format:a:b:c:d
+1:1:1:0:0:0:192:168:31:52
+```
+
+- 参数 17 = 已配置目的地数量（只读）
+- 参数 18 = 目的地类型 `[selector, type, ack|retries, addr_format]`，**type 1 = PET**
+- 参数 19 = 目的地地址 `[selector, 4 字节 IPv4]`
+
+**事件源与触发**：SEL 文件 `/var/log/sel` 是预分配的（每槽 20 字节、**整表都标成有效记录**），
+所以"记录数变多"永远不成立。改为**看时间戳**：空闲 tick 每秒扫一次 SEL，取最大时间戳，
+比上次大就对所有更新的记录触发动作（一次最多 16 条，防止刷屏）。
+
+**动作**（`pef_event()`）：
+1. `syslog(LOG_WARNING, ...)` —— 落 `/var/log/messages`。
+   注意 facility 必须是 **LOG_USER**：这台机器的 rsyslog 会把 `daemon.*` 丢掉，
+   只有 `user.*` 进 `/var/log/messages`（实测 `logger -p daemon.warning` 不落盘）。
+2. 若 PEF 动作全局控制（参数 2）的 bit0 置位，且配了目的地 → 发 **PET**（SNMPv1 trap，UDP 162）。
+
+**PET 编码**：手写 BER。踩过的坑：
+
+- 外层 SEQUENCE 的长度必须最后回填，一开始把 PDU 的输出偏移和长度混用，
+  发出去是 `30 01 ...`（长度 1），接收端直接解析失败
+- OID 的多字节子标识里，**续位必须是"除最后一组外都置 0x80"**；
+  写反了会把 `1.3.6.1.4.1.3183` 编成 `1.3.6.1.4.1.24.14209`
+- `snmpTrapOID.0` 的值必须是 **OID 类型（tag 0x06）**，不能当字符串发
+- `petEventData` 是定长 3 字节的 OCTET STRING，不能用 `strlen()` 算长度（`00 00 00` 会变成空串）
+
+实测（`ipmitool`/pyghmi 触发 + 自己写的 [trapd.py](./scripts/ipmi-lan/trapd.py) 解码）：
+
+```
+SEQUENCE len 358 / version 0 / community public / PDU 0xa4 (SNMPv1 trap)
+enterprise 1.3.6.1.4.1  generic 6  specific 1
+  1.3.6.1.2.1.1.3.0             sysUpTime.0        = 0x0001a804
+  1.3.6.1.6.3.1.1.4.1.0         snmpTrapOID.0      = 1.3.6.1.4.1.3183.1.1.1
+  1.3.6.1.4.1.3183.1.1.1.2.0    petHostname        = ubmc
+  1.3.6.1.4.1.3183.1.1.1.3.0    petDateTime        = 261117093853
+  1.3.6.1.4.1.3183.1.1.1.5.0    petEventType       = 3 (test) / 2 (event)
+  1.3.6.1.4.1.3183.1.1.1.7.0    petEventSourceType = 1 (IPMI SEL)
+  1.3.6.1.4.1.3183.1.1.1.8.0    petEventSeverity   = information
+  1.3.6.1.4.1.3183.1.1.1.9.0    petSensorType      = 0x37
+  1.3.6.1.4.1.3183.1.1.1.10.0   petSensorNumber    = 0
+  1.3.6.1.4.1.3183.1.1.1.11.0   petEventData       = 00 00 00
+  1.3.6.1.4.1.3183.1.1.1.14.0   petEventDescription = SEL 0: sensor type 0x37 ...
+```
+
+syslog 侧同时落盘：
+
+```
+2026-11-17T09:44:44 ubmc ubmc-ipmi[20121]:[user.warning] SEL event id 222:
+    sensor type 0x07, sensor 13, event 0x6f, data 11 22 33
+```
+
+### 用户管理（第二十轮）
+
+支持 `ipmitool user list / set name / set password / priv / enable / disable / test`：
+
+| 命令 | netfn/cmd | 说明 |
+|---|---|---|
+| Get User Access | App 0x44 | 返回 16 个槽位、当前启用数、priv 与 enable 标志 |
+| Set User Access | App 0x43 | 只改权限上限（第三字节是 per-link 权限，本机无 ACL，忽略）|
+| Get User Name | App 0x46 | 16 字节，不足补 0 |
+| Set User Name | App 0x45 | 可以给**空槽位**起名（真实 BMC 也允许）|
+| Set User Password | App 0x47 | `uid, op, password`；**op 0=禁用 1=启用 2=设口令 3=校验** |
+
+凭据文件 `/config/ipmi-lan.passwd` 现在是：
+
+```
+# 注释行以 # 开头
+id:name:password:max-privilege:enabled
+1:root:51L1C0M201B:4:1
+2:is_admin:51L1C0M201B:4:1
+3:opuser:Op3ratorPw:3:1
+```
+
+老的 `name:password` 两字段格式仍然能读（自动分配 id、priv=4、enabled）。
+口令必须**明文**存放 —— RAKP 用它当 HMAC 密钥，`/etc/shadow` 的哈希用不了。
+
+两个容易踩的点：
+
+- **字节布局**：`Set User Password` 是 `user_id, operation, password` 三个字段，
+  不是把 uid 和 op 挤在一个字节里。按挤在一起的写法实现时，ipmitool 的
+  `user set password 3 x` 会算成 uid 0 而返回 `0xCC`。
+- **operation 语义**：0=禁用、1=启用、2=设口令、3=校验口令。
+  按"0=设口令"实现会让 `user set password` 变成禁用用户。
+- **Get User Access 的 priv 在第 4 个数据字节**（bits 3:0），enable 标志在
+  同一个字节的 bits 7:4。放到第 3 字节时 `ipmitool user list` 会把
+  ADMINISTRATOR 显示成 USER。
+- 账号没有口令时 `user_password()` 直接返回 NULL，避免用空串当 HMAC 密钥
+  让任何人空口令登录。
+- RAKP1 里客户端申请的权限会被账号的 `max-privilege` **夹住**（只夹 `s->priv`，
+  不夹 `role_byte` —— role byte 参与 RAKP MAC，改了会认证失败）。
+
+顺带补的两条：
+
+- **App 0x54 Get Channel Cipher Suites**：返回 suite 0/1/3/17/18/19 的记录，
+  替代原来的 `Invalid command`。ipmitool 在会话建立前会问，缺了它每条命令都会
+  先打一行 `Unable to Get Channel Cipher Suites`（1.8.19 的这个查询走的是
+  IPMI 1.5 明文路径，本机实测仍会打印该提示，但不再影响任何命令）。
+- **App 0x41 Get Channel Access**：只回 2 个数据字节
+  （`0x32` = always available + user level auth + per-message auth，`0x04` = admin），
+  多了 ipmitool 会报 `Unexpected data length`。App 0x40 Set Channel Access 接受但忽略。
 
 已实现的 LAN 参数（`0x0C 0x02`，`ipmitool lan print` 全部有真实值）：
 
@@ -126,6 +380,32 @@ bit5-0 = 长度（≤63）
 
 > `Default Gateway IP` 显示 `0.0.0.0` **不是** bug —— 同一棵树里就是
 > `default-gateway,0.0.0.0`，这台机器确实没配默认路由。
+
+## 代码审视（第二十二轮）
+
+把整个守护进程过了一遍，找到并修掉下面这些，**都实测验证过**：
+
+| 问题 | 性质 | 修法 |
+|---|---|---|
+| `Set Session Privilege Level`（0x3B）不校验账号上限 | **权限提升**：priv 3 的账号直接申请 4 就能拿到管理员 | 按账号 `max-privilege` 夹住，超出返回 `0x81` |
+| Chassis Control（0x02）、Clear SEL（0x47）没有权限检查 | **越权**：priv 1 的账号也能切电/清日志 | 要求 priv ≥ 3，否则 `0x80` |
+| `lan print` 的 Default Gateway 只读 `/proc/net/route` | 只看得见 main 表，管理口的路由在 VRF 表里 → 写了也读不回来 | 改读 `is_mgmtd.conf` 的 `default-gateway`，与写路径一致 |
+| Get Channel Cipher Suites（0x54）索引越界返回 `0xCC` | ipmitool 把它当失败，每条命令都先打一行 `Unable to Get Channel Cipher Suites` | 越界返回**空列表**（只有 channel 字节）；索引按"记录"而非字节计 |
+| 用户库写入不是原子的 | 写一半断电会把整个用户库写残 | 临时文件 + `fsync` + `rename` + `sync` |
+| 会话槽位没有空闲回收，满了就踢最老的 | 8 个僵尸会话就能把在线监控踢掉 | 加 300 s 空闲过期（SOL 占用的不回收）；`alloc_session()` 给新会话盖时间戳 |
+
+自查时还踩到一个自己引入的坑：空闲回收一开始把 `last == 0`（刚分配、还没收包）当成"最久空闲"，
+一秒内就把正在握手的会话删掉 —— 现象是客户端报 `Session no longer connected`。
+现在 `last == 0` 明确表示"握手中"，不回收。
+
+### 已知限制（不是 bug，但要知道）
+
+- `MAX_SESSIONS = 8`；8 个都在用时，第 9 个会回收最久未活动的那个。
+- 会话空闲 300 s 后由 BMC 关闭（IPMI 允许）。长连接监控需要自己重连。
+- 明文口令写在 `/config/ipmi-lan.passwd`（0600）—— RAKP 必须要明文，这是协议决定的。
+- `conf_set_line()` 按 512 字节行处理，`is_mgmtd.conf` 的行都远小于此。
+- pyghmi 的 `raw_command(netfn=1, ...)` 在客户端侧就失败（`Session no longer connected`），
+  同一台机器上 netfn 6/0x0c/4 的 raw 都正常、chassis 的类型化调用也正常 —— 客户端库的怪癖。
 
 ## 第二、第三个 cipher suite：17/18/19（SHA-256）
 
@@ -248,18 +528,31 @@ FRU File ID 被当成 Asset Tag，再往后就越界崩在 `_decode_custom_field
 
 | 文件 | 用途 |
 |---|---|
-| `ubmc_ipmi_lan.c` | 守护进程（~2200 行，依赖 libcrypto） |
-| `S47is_ipmi_lan` | init 脚本（start/stop/restart/status，带守护重启） |
+| **生产件** | |
+| `ubmc_ipmi_lan.c` | 守护进程（~4400 行，静态链接 libcrypto） |
+| `build-cross.sh` | WSL 里静态交叉编译并生成 `prebuilt/`（不依赖 buildroot 工具链） |
+| `S47is_ipmi_lan` | init 脚本（start/stop/restart/status，等 eth1 进了 VRF 再绑到 VRF 上启动；优先跑 `/config/firmware/ubmc_ipmi_lan`） |
+| `S44is_fw_conf` | 把 7681/80/623 的防火墙例外写进 `/config/is_mgmtd.conf`（必须早于 S45is_mgmtd）|
+| `ipmi-selfcheck` | 本机 623 自检（Python 2.6+/3 通用），默认探 eth1 的管理地址，排障用 |
+| `repack-bank.sh` | 在真机上把新文件打进**已安装的** bank1 镜像（没有 buildroot 工具链时唯一的出镜像办法）|
+| `uimage-wrap.py` | 给 gzip 后的 cpio 加/校验 U-Boot uImage 头（mkimage 的替代，py2.6+ 可用；根 fs 的 python 没有 zlib，用 binascii）|
+| **验收测试**（真机跑，带断言）| |
 | `probe623.py` | 裸 UDP 探活：发一条合法的 IPMI 1.5 Get Channel Auth Capabilities |
-| `ipmi-client-test.py` | pyghmi 验收测试（RMCP+ 握手 + 电源） |
-| `ipmi-extras-test.py` | pyghmi 验收：SDR/传感器 / FRU / SEL / bootdev / Reading Factors |
-| `ipmi-sol-raw-test.py` | pyghmi 验收：SOL 数据通路（不 ACK 的客户端，验证退化路径） |
-| `ipmi-sol-flow-test.py` | pyghmi 验收：SOL 滑动窗口（ACK 的客户端）+ BREAK 转发 |
+| `ipmi-client-test.py` | pyghmi：RMCP+ 握手 + 电源 |
+| `ipmi-extras-test.py` | pyghmi：SDR/传感器 / FRU / SEL / bootdev / Reading Factors |
+| `ipmi-sol-raw-test.py` | pyghmi：SOL 数据通路（不 ACK 的客户端，验证退化路径） |
+| `ipmi-sol-flow-test.py` | pyghmi：SOL 滑动窗口（ACK 的客户端）+ BREAK 转发 |
+| `lanparam_test.py` | LAN 次要参数读写回环（auth / community / ARP / VLAN）|
+| `lanparam_persist.py` | LAN 参数跨守护进程重启的持久化验证（write / read / restore）|
+| `sdr_lan_test.py` | SDR 用户仓库写入（add / partial add / delete / clear）+ LAN 参数 |
+| `pet_community_test.py` | 起本地 trap 接收器，验证 PET 用的是配置的 community |
+| `trapd.py` | udp/162 监听 + BER 解码（`pet_community_test.py` 用它）|
+| `poll623.py` | 连续探测，量开机到 623 可用的时间 |
+| **一次性硬件探针**（保留原因见 sol-design.md / 下文 VRF 一节）| |
+| `sockprobe2.c` | VRF 绑定方式对照实验（wildcard / vrf-pub / eth1 / REUSEADDR / PKTINFO）|
 | `conprobe.c` | 控制台 socket 探针，确认 `/var/run/console_manager_socket` 是双向 fan-out |
 | `brktest.c` | BREAK 可行性验证：另开 `/dev/ttyS1` 做 `TIOCSBRK` 是否可行 |
 | `brkcount.c` | `TIOCGICOUNT` 探针：确认 UART 维护 BREAK 计数器（主机→BMC 检测的前提）|
-| `apply-runtime.sh` | **不刷机**前提下在真机上部署/调试，仅在开发时用 |
-| `deploy-ipmi-lan.ps1` | 开发期把交叉编译产物经 Web RPC 推上真机并重启 |
 
 ## 凭据为什么单独存
 
@@ -275,7 +568,7 @@ SIK            = HMAC-SHA1(password, Rc||Rm||role||userlen||user)
 我们放在 `/config/ipmi-lan.passwd`（`/config` 是 mmcblk0p5 的持久 ext4，120 MB），
 格式 `user:password`，权限 0600。init 脚本首次启动会播种一个默认口令。
 
-## 踩过的四个坑（都是从「客户端无响应」倒查出来的）
+## 踩过的六个坑（都是从「客户端无响应」倒查出来的）
 
 ### 1. socket 既不能绑 vrf-pub，也不能开 SO_REUSEADDR
 
@@ -333,6 +626,51 @@ if (argc > 1 && strcmp(argv[1], "-d") == 0)
 init 脚本因此只写 `"$DAEMON" -d`，同步返回；日志由守护进程自己 `freopen` 到
 `/var/log/ipmi-lan.log`，完全不依赖调用者的重定向。
 
+### 6. 开机后 IPMI 不通：两条独立的错（都不是内核时序）
+
+现象：从 init 启动时 `ss -ulnp` 能看到 `0.0.0.0:623`，`iptables -vnL INPUT` 的
+623 规则计数器在涨，但客户端收不到任何回复；手动 `restart` 一次就好了。
+看起来像"开机早期创建的 socket 收不到包"，实际是两个独立错误叠在一起。
+
+#### 6.1 ACCEPT 规则被 mgmtd 的 DROP 埋在下面
+
+原先 `S47is_ipmi_lan` 自己 `iptables -I INPUT <pub-drop 位置>` 插 623 的 ACCEPT。
+问题是 mgmtd **稍后**才逐条用 `-I INPUT 1` 下发自己的规则（`pub-state`/`pub-icmp`/
+`pub-ssh`/`pub-web`/`pub-web-be`/`pub-drop`），每下发一条就把我们那条往下推一格，
+最后 623 落到 `-i vrf-pub -j DROP` 之下 → 静默丢弃。
+
+`restart` 之所以"治好"它：脚本重新插入时 DROP 已经在链里，位置算对了。
+
+**修法**：和 80/7681 完全一样，把 623 写进 `/config/is_mgmtd.conf`（`S44is_fw_conf`），
+由 mgmtd 自己按文件顺序装到 DROP 上面。实测重启后
+`iptables --line-numbers` 里 623 在第 8 行、`DROP all` 在第 13 行。
+
+#### 6.2 socket 必须绑到 VRF，否则收不到也回不去
+
+eth1（OOB 口）是 `vrf-pub` 的 slave，路由全在 **table 300**，main 表里连
+`192.168.31.0/24` 都没有。于是普通的 `0.0.0.0:623` wildcard socket：
+
+- **收**：包在 eth1 上到达，`sdif != 0`。`net.ipv4.udp_l3mdev_accept=0`（mgmtd 的默认）
+  时内核不把这种包给 root 表的 wildcard socket —— 防火墙放行、`NoPorts` 增长、
+  socket 就在那儿，却一个字节都收不到。
+- **发**：即使把 `udp_l3mdev_accept` 置 1 让收方向通了，回复仍按 main 表选路 →
+  `ENETUNREACH`，客户端照样超时。
+
+对照实验（同机、同时刻、同一端口）：`sockprobe2 6280:r 6283 623 6284:p` 四个
+wildcard socket 全部正常应答，唯独守护进程那条不应答；把 eth1 `nomaster` 掉之后
+Web(443)/SSH(22) 还行、**IPMI 立刻 0/20** —— 证明 Web 那几个守护进程本来就活在 VRF 里，
+只有 IPMI 的 socket 在默认表。
+
+**修法**：`S47is_ipmi_lan` 先 `wait_ready()` 等到 eth1 **已被 enslave**
+（`/sys/class/net/eth1/master` 存在）且有地址，再用
+`IPMI_LAN_BIND=<master> ubmc_ipmi_lan -d` 把监听 socket `SO_BINDTODEVICE` 到
+`vrf-pub`。这样收方向走 `sk_bound_dev_if == sdif` 命中，发方向自动用 table 300
+选源地址和路由，两个方向都不再依赖 `udp_l3mdev_accept`。
+（`udp_l3mdev_accept=1` 仍然保留，只服务"拿不到 VRF 名"时的 wildcard 兜底。）
+
+**结果**：刷入第十七轮之后重启，**开机 70 秒** IPMI 就能正常应答，
+不需要重启守护进程，也没有任何看门狗。
+
 ## 另一个客户端兼容性坑
 
 
@@ -357,6 +695,29 @@ python ubmc-build\scripts\ipmi-lan\probe623.py 192.168.31.72
 # 完整验收（安装 pyghmi： pip install pyghmi）
 python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py 192.168.31.72 root 51L1C0M201B
 python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py 192.168.31.72 root 51L1C0M201B --power-on
+
+# LAN 次要参数读写回环（auth / community / ARP / VLAN）
+python ubmc-build\scripts\ipmi-lan\lanparam_test.py 192.168.31.72
+
+# LAN 参数跨重启持久化：write -> 重启守护进程 -> read -> restore
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 write
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 read
+python ubmc-build\scripts\ipmi-lan\lanparam_persist.py 192.168.31.72 restore
+
+# SDR 仓库写入（add / partial add / delete / clear）+ LAN 参数
+python ubmc-build\scripts\ipmi-lan\sdr_lan_test.py 192.168.31.72
+
+# PET 里用的 community 是否就是配置的那条
+python ubmc-build\scripts\ipmi-lan\pet_community_test.py 192.168.31.72 <本机IP>
+```
+
+`ipmitool` 一侧的等价验收（WSL 里跑，注意 `ip route add 192.168.31.0/24 via …`
+否则包根本发不出去）：
+
+```sh
+B="-H 192.168.31.72 -U root -P 51L1C0M201B -I lanplus -C 3"
+ipmitool $B mc info; ipmitool $B lan print 1; ipmitool $B sdr info
+ipmitool $B sdr list; ipmitool $B fru; ipmitool $B user list 1; ipmitool $B sel list
 ```
 
 实测输出：
@@ -372,6 +733,35 @@ python ubmc-build\scripts\ipmi-lan\ipmi-client-test.py 192.168.31.72 root 51L1C0
   set_power('on')            {'powerstate': 'on'}
 all checks passed
 ```
+
+第二十五轮的 `ipmitool` 实测片段（节选，全部字段都有值、没有 `Not Available`
+的报错行）：
+
+```
+$ ipmitool $B sdr info
+SDR Version                         : 0x51
+Record Count                        : 24
+Free Space                          : 8160 bytes
+Most recent Addition                : 11/17/26 17:48:24 HKT
+Most recent Erase                   : 11/17/26 17:48:24 HKT
+SDR overflow                        : no
+SDR Repository Update Support       : unspecified
+Delete SDR supported                : yes
+Partial Add SDR supported           : yes
+Reserve SDR repository supported    : yes
+SDR Repository Alloc info supported : yes
+
+$ ipmitool $B lan print 1
+Auth Type Support       : NONE MD5 PASSWORD
+IP Address Source       : DHCP Address
+IP Address              : 192.168.31.72
+SNMP Community String   : public
+BMC ARP Control         : ARP Responses Enabled, Gratuitous ARP Disabled
+802.1q VLAN ID          : Disabled
+RMCP+ Cipher Suites     : 3,17,6,192,164,163,162,160
+```
+
+`ipmitool $B sel list` 197 条全部正常解码（约 10 ms/条）。
 
 ## 调试
 

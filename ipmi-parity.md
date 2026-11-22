@@ -257,8 +257,13 @@ GET /ws   : 101（SOL 与 Web Console 并存）
 完整协议细节、踩坑与已知缺口见 [ipmi-lan.md](./ipmi-lan.md) 和
 [sol-design.md](./sol-design.md)。
 
-**还没实现**（都不影响日常运维）：Set LAN Configuration Parameters（读全部实现了，
-`lan set` 返回 `0xC1`）、Set/Get User Access、IPMB 桥接、PEF、SDR 设备端写入。
+**还没实现**（只有一项，而且是不该做的）：IPMB 桥接 —— 板上 i2c 没有 `0x20` 类
+从机地址，没有可桥对象，NetFn `0x2C` 回 `0xC1`（这正是"没有桥的 BMC"的标准应答）。
+
+第二十五轮之后，下面这些都已经可用：Set/Get LAN Configuration Parameters
+（含 VLAN / community / auth type / ARP 控制）、Set/Get User Access、
+PEF 配置面 + 告警目的地 + PET/syslog 发送器、SDR 仓库写入。详见
+[ipmi-lan.md](./ipmi-lan.md)。
 
 ## 建议的使用方式
 

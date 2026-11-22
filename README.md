@@ -258,6 +258,8 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 | [web-stack.md](web-stack.md) | 四套路由（sweb / rpc / restapi / redfish）与 RPC 提权洞 |
 | [webtty-diagnosis.md](webtty-diagnosis.md) | **Web Console 打不开的真正原因**：防火墙少了 7681/80 的例外 |
 | [ipmi-parity.md](ipmi-parity.md) | **IPMI 级能力盘点**：控制台、电源、虚拟光驱、SEL、健康；IPMI over LAN 为自建服务端 |
+| [ipmi-lan.md](ipmi-lan.md) | **自建的 IPMI 2.0 / RMCP+ 服务端**：协议细节、用户管理、Set LAN、PEF/PET、SDR 仓库、踩过的坑与验收脚本 |
+| [sol-design.md](sol-design.md) | SOL 数据通路设计：BREAK、ACK 滑动窗口、与 Web Console 并存 |
 | [diff-vs-factory.md](diff-vs-factory.md) | 自编译镜像与出厂 1.2.0.8 的逐项差异 |
 | [dead-libs-audit.md](dead-libs-audit.md) | 「死文件」核查：34 个真孤儿 + 4 个 dlopen 插件 |
 | [gaps.md](gaps.md) | 剩余缺口的分类与判定依据 |
@@ -281,6 +283,16 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 | `05-sd-probe.cmd` | 卡上的 U-Boot | 打印 mmc 设备编号和分区表 |
 | `press-setup-keys.ps1` | Windows | 串口上循环按 ESC/DEL/F2/F10 进固件设置 |
 | `boot0-sd-first{,-v2}.{cmd,scr}` | BMC 的 U-Boot | 改过的 `boot0.scr`：先试 SD 再回退 eMMC，见 [uboot.md](uboot.md) |
+| `rebuild-image.sh` | **BMC 上** | 在本机重打 `rootfs.cpio.uboot`（要 buildroot 产物；没有时用 `ipmi-lan/repack-bank.sh`） |
+
+**IPMI over LAN 那一套**全部在 [scripts/ipmi-lan/](scripts/ipmi-lan/)，逐个文件说明见
+[ipmi-lan.md 的「文件」一节](ipmi-lan.md)。最常用的三个：
+
+| 脚本 | 跑在哪 | 作用 |
+|---|---|---|
+| `ipmi-lan/build-cross.sh` | WSL | 静态交叉编译守护进程，产物落到 `prebuilt/` |
+| `ipmi-lan/S47is_ipmi_lan` | BMC | init 脚本（装到 `/etc/init.d/`，优先跑 `/config/firmware/ubmc_ipmi_lan`） |
+| `ipmi-lan/repack-bank.sh` | BMC | 没有 buildroot 工具链时，把新文件打进**已安装的** bank1 镜像 |
 
 ---
 

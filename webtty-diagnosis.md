@@ -221,6 +221,11 @@ index      200   17,727 B
 
 新增 `etc/init.d/S46is_web_fw`，按 58080 的同一套路补两类例外：
 
+> **更新（第十一轮起）**：下面这两条 `ACCEPT` 已经**上游化**挪进
+> `/config/is_mgmtd.conf`，由 `S44is_fw_conf` 写入、mgmtd 自己下发；`S46is_web_fw`
+> 只保留 hairpin `DROP`、luci 配置和 nginx 路由。细节见
+> [gaps.md](./gaps.md) 第七节第 3 条。下面的历史代码保留说明当时的设计。
+
 ```sh
 # 7681（ttyd）：只放行「源 MAC = vrf-pub 自身 MAC」的流量，即 nginx 的
 # hairpin；局域网直连 7681 仍然 DROP
