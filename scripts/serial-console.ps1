@@ -22,8 +22,9 @@
     抓多少秒后自动停。0 = 一直抓到 Ctrl-C。
 
 .PARAMETER Send
-    打开串口后发一串文本。'\r' '\n' '\t' 会被解释成回车/换行/制表。
-    例如 -Send "reset\r"
+    打开串口后发一串文本。'\r' '\n' '\t' '\e' 会被解释成回车/换行/制表/ESC，
+    '\xNN' 会发任意一个字节（十六进制）。
+    例如 -Send "reset\r"、-Send '\x18'（Console 的 Ctrl+X 切换）。
 
 .PARAMETER LogFile
     日志路径。不指定则写到当前目录 serial-<时间戳>.log。
@@ -44,6 +45,10 @@
     给静默的 U-Boot 发 reset，然后抓 20 秒看重启过程。
 
 .EXAMPLE
+    .\serial-console.ps1 -Send '\x18' -Seconds 5
+    发 Ctrl+X，在「主机控制台」和「uBMC 自己的控制台」之间切换。
+
+.EXAMPLE
     .\serial-console.ps1 -Send "`e" -Seconds 5
     往 GRUB 菜单发 ESC（退出编辑回到菜单）。
 #>
@@ -59,7 +64,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Get-PortList { @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object) }
+# 注意别让 PowerShell 把单元素数组拆成字符串：'COM5'[0] 会得到 'C'，
+# 于是串口名变成 "C"、Open() 报 "does not resolve to a valid serial port"。
+function Get-PortList { , @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object) }
 
 if ($ListPorts) {
     $p = Get-PortList
@@ -120,6 +127,10 @@ $writer.AutoFlush = $true
 try {
     if ($Send) {
         $text = $Send -replace '\\r', "`r" -replace '\\n', "`n" -replace '\\t', "`t" -replace '\\e', "`e"
+        # \xNN：发任意字节，例如 Console 的 Ctrl+X 是 -Send '\x18'
+        $text = [regex]::Replace($text, '\\x([0-9A-Fa-f]{2})', {
+            param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16)
+        })
         $sp.Write($text)
         Write-Host ">> 已发送 $($text.Length) 字符" -ForegroundColor Yellow
         Write-Host ''

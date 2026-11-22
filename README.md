@@ -21,7 +21,7 @@
 |---|---|
 | 跑的镜像 | `rootfs.cpio.uboot` **55,823,961 B**，sha256 `2e5efcec…`，在 `/dev/mmcblk0p3`（bank 1）|
 | 版本横幅 | `##UBMC_1.1.0.5_LOCAL_BUILD_bd9de8c_v25##`（见 `/etc/product/UBMC/version/`）|
-| U-Boot | **原厂没动**（p1 里 `MLO` 60,228 B / `u-boot.img` 435,668 B），`silent=1` 仍在 |
+| U-Boot | p1 是**一字节补丁版** `71536094…`（`silent=0`，其余与出厂 `63ed4e20…` 一致），`u-boot.img.prod` 留了出厂原件；`MLO` 未动。前面板看不到 U-Boot 输出（那个口 SPL 之后接主机），见 [uboot.md](uboot.md) |
 | 内核 | 自编译的 4.14.54（同源码同配置，只有 1 个 `.ko` 与出厂不同），`dt.dtb` 与出厂 sha256 相同 |
 | IPMI over LAN | ✅ udp/623 可用，用户管理 / LAN 读写 / PEF+PET / SDR 仓库 / SOL 全通 |
 | Web | ✅ LuCI + `/rpc` + `/restapi` + `/redfish` + Web Console（7681）全通 |
