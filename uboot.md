@@ -400,31 +400,103 @@ if fatload mmc 1:1 0x81000000 /boot0.scr.orig; then fatwrite mmc 1:1 0x81000000 
 
 ---
 
+## 不重编也能改：`silent` 一字节补丁（**推荐路径**）
+
+出厂 `u-boot.img` 不是 legacy uImage，而是 **FIT 镜像**（一个 DTB，magic `0xd00dfeed`）：
+
+```
+FIT totalsize  897 B（数据区从 0x384 开始）
+/images/firmware@1   data-offset=0        size=401752   ← 真正的 U-Boot 二进制
+/images/fdt@1        data-offset=401752   size=33014    ← 设备树（与出厂 sha256 相同）
+version  U-Boot 2017.01UBMC_R102_20181205-00360-gc6c77f9f4f-dirty for ubmc335x board
+hash 节点  NONE          ← 所以改数据**不需要**重算任何校验和
+```
+
+二进制未压缩，默认环境串里的 `silent=1` 就原样躺在里面（文件偏移 `0x39981`，
+在 payload 内 `+0x395FD`）。**把那个 `1` 改成 `0`** 就得到「生产版 + 串口有输出」，
+其余一个字节都不动：
+
+```sh
+# 打印现状（不改文件）
+python scripts/patch-uboot-silent.py check u-boot.img
+
+# 产出生产版 + silent=0
+python scripts/patch-uboot-silent.py patch  u-boot.img  u-boot-silent0.img
+
+# 想退回 silent=1
+python scripts/patch-uboot-silent.py patch --value 1 u-boot.img u-boot-silent1.img
+```
+
+实测（出厂 `63ed4e20…` → 补丁版 `71536094…`，都是 435,668 B）：
+
+| | 出厂 | 补丁版 |
+|---|---|---|
+| 字节差异 | — | **1 个**（`0x39988`：`'1'`→`'0'`）|
+| `silent=1` / `silent=0` | 1 / 0 | 0 / 1 |
+| `Booting from bank`（生产版特征）| 3 | **3** |
+| `Failed to get emmc device` | 1 | **1** |
+| FIT 结构 / 版本串 / 大小 | — | **完全不变** |
+
+对照组：我们自己编的 SD 版 `u-boot.img`（`8ae7af48…`）里 `Booting from bank` 与
+`Failed to get emmc device` **都是 0** —— 这正是它不能当生产版用的字符串级证据。
+
+> 工具会拒绝三种情况：不是 FIT、payload 里有 hash 节点（那才需要重算）、
+> payload 里 `silent=` 出现次数不为 1。补完自己再 `check` 一遍即可。
+
+### 刷写：`scripts/flash-uboot.sh`
+
+在 BMC 上跑：
+
+```sh
+sh scripts/flash-uboot.sh -n /var/images/u-boot.img   # 先 dry-run，只报告
+sh scripts/flash-uboot.sh    /var/images/u-boot.img   # 备份 + 写入 + 回读校验
+reboot
+```
+
+脚本的行为（每一步都挡住一种翻车方式）：
+
+1. 新的 `u-boot.img` 开头不是 `d00dfeed` 直接拒绝；
+2. 把当前 p1 的 `u-boot.img` 复制到 `/var/images/uboot-backup/<时间戳>`，
+   并在 p1 上留一份 `u-boot.img.prod`（**只在不存在时创建**，不会被覆盖）；
+3. 先写 `u-boot.img.new` → `sync` → 回读 `sha256` 与源一致 → **才** `mv` 覆盖；
+4. 全程不碰 `MLO`、`boot0.scr`、`boot1.scr`，也不碰 `0x10000`/`0x11000` 两个标志。
+
+因为 `boot flag` 不变，重启后仍然进同一个 bank，只是这次串口会说话。
+
+回滚有一条"串口静默也能用"的盲发命令（前提是第 2 步留了 `.prod`）：
+
+```text
+fatload mmc 1:1 0x81000000 /u-boot.img.prod; fatwrite mmc 1:1 0x81000000 u-boot.img $filesize; reset
+```
+
+---
+
 ## 还差什么（U-Boot 侧的真实缺口）
 
 | 想要的 | 现状 |
 |---|---|
 | SD / install 版 U-Boot | ✅ 已编出（`../ubmc-sd-boot/`），产物哈希有记录，**但从没上机跑过** |
-| **生产版 + `silent=0`** | ❌ **没有这份产物** —— 这才是"只想要串口有输出"该刷的东西 |
+| **生产版 + `silent=0`** | ✅ **已用一字节补丁产出**（`71536094…`，435,668 B，见上一节），**尚未刷入** |
 | SD 启动能用 | ❌ 判死（ROM 不读 SD / 要动 SYSBOOT 电阻），见 [sdcard.md](sdcard.md) |
 | `boot0.scr` 层面的定制 | 已试过（`boot0-sd-first{,-v2}.scr`），最终回退到出厂脚本 |
+| 从源码重编生产版 | 可选，非必需 —— 一字节补丁的行为等价；只有在想改 `bootcmd`/加命令时才需要 |
 
 **为什么不能直接刷现成的 SD 版**：它带 `CONFIG_UMBC_SD_UBOOT=y`，会把
 `mmcdev` 设成 `0`（SD 卡）并去读 `boot.scr`。没有可用的 SD 启动，刷它等于
-把 eMMC 里的系统"看不见了"。要的是：
+把 eMMC 里的系统"看不见了"。字符串级证据：SD 版里 `Booting from bank` 与
+`Failed to get emmc device` 都是 0，生产版各有 3 和 1。
 
-```
-ubmc335x_defconfig（生产版，CMDCONFIG 不动 mmcdev）
-    + include/configs/ubmc335x.h 里 silent 1 -> 0
-```
-
-编完之后按 [firmware-upgrade.md](firmware-upgrade.md) 的规矩来，另外再叠三条：
+刷写三条铁律（与上一节的脚本一致）：
 
 1. **只刷 `u-boot.img`，绝不动 `MLO`** —— 原厂 SPL 保证 ROM 永远能找到合法 MLO，
    所以 ROM 级（L4）砖不会发生；
 2. 刷前 `sha256sum` 回读校验，刷后再校验一次；
 3. **串口必须在线**（这台机是 COM5）—— 没有串口就看不出 `silent` 到底改成功没有，
    也没法在起不来时盲救。
+
+> 从源码重编的完整步骤见本文档上半部分（`ubmc335x_defconfig` + 把
+> `include/configs/ubmc335x.h` 的 `silent` 从 1 改成 0）。它和一字节补丁的区别
+> 只在于"顺带把整个 U-Boot 换成自编译版"—— 对当前目标而言是多余的。
 
 ### 备选方案：不刷引导，只改 saved env
 

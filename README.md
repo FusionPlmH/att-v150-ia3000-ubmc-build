@@ -299,6 +299,8 @@ cp /mnt/p1/boot0.scr /mnt/p1/boot0.scr.orig
 | `01-build.sh` | 宿主 Linux | 完整构建。`-j8` 并行，`uboot-custom` 只编一个包 |
 | `02-build-no-uboot.sh` | 宿主 Linux | 跳过 u-boot 只出 rootfs（u-boot 编译失败时用） |
 | `03-fix-uboot-tarball.sh` | 宿主 Linux | 重建上游已失效的 u-boot 源码包 |
+| `patch-uboot-silent.py` | Windows / Linux | 把出厂 `u-boot.img` 的 `silent` 翻成 0（**一字节补丁**，不重编；`check` / `patch` 两个子命令）|
+| `flash-uboot.sh` | **BMC 上** | 只替换 p1 的 `u-boot.img`：FIT 校验 → 双备份 → 回读 sha256 → 才覆盖（`-n` 先 dry-run）|
 | `ubmc-chroot.sh` | **BMC 上** | chroot 进一个 rootfs 目录测试，不重启、不动 eMMC |
 | `serial-console.ps1` | Windows | 串口抓取 / 发送（`-ListPorts` 列端口、`-Seconds` 限时、`-Send` 发命令） |
 | `04-make-sdcard.ps1` | Windows | 写 SD 安装盘（`-List` 先看盘号） |
