@@ -5,11 +5,19 @@
 > **现状（第二十五轮）：机器上没有刷 U-Boot。**
 > `/dev/mmcblk0p1`（FAT，128 MiB）里还是**出厂**的引导件，实测：
 > `MLO` 60,228 B（sha256 `7fe8219e…`）、`u-boot.img` 435,668 B（sha256 `63ed4e20…`）、
-> `boot0.scr` 与 `boot0.scr.orig` 各 328 B。
+> `boot0.scr` 与 `boot0.scr.orig` **哈希相同**（`26a4a41e…`，改过的版本已回退）、
+> `uboot_version.txt` = `##UBMC_UBOOT_1.0.2_1d22f81a##`、`vendor.txt` = `##ATT##`。
 > 二十多轮改动全部落在 **bank 1 的 rootfs**（`/dev/mmcblk0p3`）里，
 > 所以本文关于"怎么编 U-Boot"的内容是**备用方案**，不是当前运行态。
 > 也就是说：**`silent=1` 仍然在生效**，串口静默时按
 > [chroot-and-recovery.md](chroot-and-recovery.md) 的 L2 处置。
+>
+> **已编出来的只有 SD 版**（`../ubmc-sd-boot/`，`CONFIG_UMBC_SD_UBOOT=y`：
+> MLO 59,864 B / `fcac8c82…`、u-boot.img 432,452 B / `8ae7af48…`），
+> 而且**从没上机跑过**。真正还缺的那份是 **生产版 + `silent=0`**
+> （`ubmc335x_defconfig` + 把 `include/configs/ubmc335x.h` 的 `silent` 改 0）——
+> 它才是"只想要串口有输出"时该刷的东西；SD 版不能直接拿来当生产版用，
+> 因为它会把 `mmcdev` 指到 SD 卡。见文末「还差什么」。
 
 ---
 
@@ -386,6 +394,52 @@ cp boot0.scr boot0.scr.orig
 ```text
 if fatload mmc 1:1 0x81000000 /boot0.scr.orig; then fatwrite mmc 1:1 0x81000000 boot0.scr 328; fi; reset
 ```
+
+（实测有效：改坏 `boot0.scr` 那次的"变砖"就是这么一条命令救回来的。
+现在 p1 上 `boot0.scr` 与 `boot0.scr.orig` 已经是同一个哈希 `26a4a41e…`。）
+
+---
+
+## 还差什么（U-Boot 侧的真实缺口）
+
+| 想要的 | 现状 |
+|---|---|
+| SD / install 版 U-Boot | ✅ 已编出（`../ubmc-sd-boot/`），产物哈希有记录，**但从没上机跑过** |
+| **生产版 + `silent=0`** | ❌ **没有这份产物** —— 这才是"只想要串口有输出"该刷的东西 |
+| SD 启动能用 | ❌ 判死（ROM 不读 SD / 要动 SYSBOOT 电阻），见 [sdcard.md](sdcard.md) |
+| `boot0.scr` 层面的定制 | 已试过（`boot0-sd-first{,-v2}.scr`），最终回退到出厂脚本 |
+
+**为什么不能直接刷现成的 SD 版**：它带 `CONFIG_UMBC_SD_UBOOT=y`，会把
+`mmcdev` 设成 `0`（SD 卡）并去读 `boot.scr`。没有可用的 SD 启动，刷它等于
+把 eMMC 里的系统"看不见了"。要的是：
+
+```
+ubmc335x_defconfig（生产版，CMDCONFIG 不动 mmcdev）
+    + include/configs/ubmc335x.h 里 silent 1 -> 0
+```
+
+编完之后按 [firmware-upgrade.md](firmware-upgrade.md) 的规矩来，另外再叠三条：
+
+1. **只刷 `u-boot.img`，绝不动 `MLO`** —— 原厂 SPL 保证 ROM 永远能找到合法 MLO，
+   所以 ROM 级（L4）砖不会发生；
+2. 刷前 `sha256sum` 回读校验，刷后再校验一次；
+3. **串口必须在线**（这台机是 COM5）—— 没有串口就看不出 `silent` 到底改成功没有，
+   也没法在起不来时盲救。
+
+### 备选方案：不刷引导，只改 saved env
+
+如果 `silent=1` 落在 **U-Boot 保存的 env** 里（不是只有编译进去的默认值），
+理论上可以用 `fw_setenv silent 0` 改掉，一行不动引导。
+
+但这条路有两个前提，现在都**没有**验证过：
+
+- 得先 dump 出当前的 env 并**原样回写**（只加 `silent=0`）。U-Boot 读到合法 env
+  时**不会**再把编译默认值合并进来，写残了会丢 `bootcmd` → 变成真"静默+不启动"；
+- 需要串口兜底。
+
+设备上现在的状况：`/proc/mtd` 里没有分区、也没有 `fw_printenv`/`fw_setenv`，
+真要走这条得先摸清 SPI NOR 的 env 偏移和冗余两份的布局。
+**在串口接回来之前，这条路不要动。**
 
 > `fatwrite` 的**文件名别带开头斜杠**（`/boot0.scr` 会在 FAT 根目录留下非法目录项，
 > 要 `dosfsck -a -v /dev/mmcblk0p1` 修）。
